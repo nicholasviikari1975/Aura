@@ -85,7 +85,7 @@ app.post('/merge', async (req, res) => {
     execSync(
       `ffmpeg -y -f concat -safe 0 -i ${concatFile} -i ${tmp}/audio.mp3 ` +
       `-map 0:v:0 -map 1:a:0 -c:v libx264 -crf 32 -preset ultrafast ` +
-      `-vf "tpad=stop_mode=clone:stop_duration=15" ` +
+      `-vf "tpad=stop_mode=clone:stop_duration=30" ` +
       `-c:a aac -b:a 96k ` +
       `${tmp}/final.mp4`,
       { timeout: 300000, stdio: 'pipe' }
