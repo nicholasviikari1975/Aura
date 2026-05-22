@@ -78,59 +78,18 @@ app.post('/merge', async (req, res) => {
     await download(audio_url, `${tmp}/audio.mp3`)
     console.log(`[merge] audio ladattu`)
 
+    // Toista viimeinen klippi 5 kertaa (5 x 5s = 25s extra)
+    // 7 klippia x 5s = 35s + 25s = 60s — riittaa 45s audiolle
+    const lastClip = `${tmp}/clip${clip_urls.length - 1}.mp4`
+    const allClipLines = [
+      ...clip_urls.map((_, i) => `file '${tmp}/clip${i}.mp4'`),
+      ...Array(5).fill(`file '${lastClip}'`)
+    ]
+
     const concatFile = `${tmp}/concat.txt`
-    fs.writeFileSync(concatFile, clip_urls.map((_, i) => `file '${tmp}/clip${i}.mp4'`).join('\n'))
+    fs.writeFileSync(concatFile, allClipLines.join('\n'))
+    console.log(`[merge] concat: ${allClipLines.length} klippia (${allClipLines.length * 5}s)`)
 
-    // Kiintea 25s pad — 7 klippia x 5s = 35s + 25s = 60s, riittaa 45s audiolle
-    const padNeeded = 25
-    console.log(`[merge] video: ${clip_urls.length * 5}s + pad: ${padNeeded}s`)
-
-    // Vaihe 1: yhdista klipsit + freeze-frame
-    console.log(`[merge] vaihe 1 — concat + tpad ${padNeeded}s...`)
+    console.log(`[merge] running ffmpeg...`)
     execSync(
-      `ffmpeg -y -f concat -safe 0 -i ${concatFile} ` +
-      `-vf "tpad=stop_mode=clone:stop_duration=${padNeeded}" ` +
-      `-c:v libx264 -crf 32 -preset ultrafast ` +
-      `${tmp}/video_padded.mp4`,
-      { timeout: 180000, stdio: 'pipe' }
-    )
-
-    // Vaihe 2: yhdista video + audio — -shortest leikkaa audion loppuessa
-    console.log(`[merge] vaihe 2 — yhdista audio...`)
-    execSync(
-      `ffmpeg -y -i ${tmp}/video_padded.mp4 -i ${tmp}/audio.mp3 ` +
-      `-map 0:v -map 1:a ` +
-      `-c:v copy -c:a aac -b:a 96k -shortest ` +
-      `${tmp}/final.mp4`,
-      { timeout: 120000, stdio: 'pipe' }
-    )
-
-    const finalSize = (fs.statSync(`${tmp}/final.mp4`).size / 1024 / 1024).toFixed(1)
-    console.log(`[merge] ffmpeg done — ${finalSize} MB`)
-
-    const storagePath = `merged/job_${job_id}_final.mp4`
-    const publicUrl = await uploadToSupabase(`${tmp}/final.mp4`, storagePath)
-
-    await sb.from('video_jobs').update({
-      status: 'merged',
-      merged_video_url: publicUrl,
-      updated_at: new Date().toISOString()
-    }).eq('id', job_id)
-
-    console.log(`[merge] DONE — ${publicUrl}`)
-  } catch (err) {
-    console.error(`[merge] ERROR job ${job_id}:`, err.message)
-    await sb.from('video_jobs').update({
-      status: 'done',
-      updated_at: new Date().toISOString()
-    }).eq('id', job_id)
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true })
-  }
-})
-
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge' }))
-
-app.listen(process.env.PORT || 3000, () => {
-  console.log(`Merge service running on port ${process.env.PORT || 3000}`)
-})
+      `ffmpeg -y -f concat -safe 0
