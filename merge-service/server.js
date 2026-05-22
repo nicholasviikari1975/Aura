@@ -26,7 +26,7 @@ async function download(url, dest) {
 
 app.use((req, res, next) => {
   const auth = req.headers.authorization
-  if (!auth || auth !== 'Bearer ' + process.env.SUPABASE_SERVICE_ROLE_KEY) {
+ if (!auth || auth !== 'Bearer ' + process.env.MERGE_API_KEY) {
     return res.status(401).json({ ok: false, error: 'Unauthorized' })
   }
   next()
