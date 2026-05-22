@@ -92,4 +92,38 @@ app.post('/merge', async (req, res) => {
 
     console.log(`[merge] running ffmpeg...`)
     execSync(
-      `ffmpeg -y -f concat -safe 0
+      `ffmpeg -y -f concat -safe 0 -i ${concatFile} -i ${tmp}/audio.mp3 ` +
+      `-map 0:v -map 1:a -c:v libx264 -crf 32 -preset ultrafast ` +
+      `-c:a aac -b:a 96k -shortest ${tmp}/final.mp4`,
+      { timeout: 300000, stdio: 'pipe' }
+    )
+
+    const finalSize = (fs.statSync(`${tmp}/final.mp4`).size / 1024 / 1024).toFixed(1)
+    console.log(`[merge] ffmpeg done — ${finalSize} MB`)
+
+    const storagePath = `merged/job_${job_id}_final.mp4`
+    const publicUrl = await uploadToSupabase(`${tmp}/final.mp4`, storagePath)
+
+    await sb.from('video_jobs').update({
+      status: 'merged',
+      merged_video_url: publicUrl,
+      updated_at: new Date().toISOString()
+    }).eq('id', job_id)
+
+    console.log(`[merge] DONE — ${publicUrl}`)
+  } catch (err) {
+    console.error(`[merge] ERROR job ${job_id}:`, err.message)
+    await sb.from('video_jobs').update({
+      status: 'done',
+      updated_at: new Date().toISOString()
+    }).eq('id', job_id)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge' }))
+
+app.listen(process.env.PORT || 3000, () => {
+  console.log(`Merge service running on port ${process.env.PORT || 3000}`)
+})
