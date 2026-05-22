@@ -81,14 +81,24 @@ app.post('/merge', async (req, res) => {
     const concatFile = `${tmp}/concat.txt`
     fs.writeFileSync(concatFile, clip_urls.map((_, i) => `file '${tmp}/clip${i}.mp4'`).join('\n'))
 
-    console.log(`[merge] running ffmpeg...`)
+    // Vaihe 1: yhdista klipsit + lisaa freeze-frame lopussa
+    console.log(`[merge] vaihe 1 — yhdista klipsit + tpad...`)
     execSync(
-      `ffmpeg -y -f concat -safe 0 -i ${concatFile} -i ${tmp}/audio.mp3 ` +
-      `-map 0:v:0 -map 1:a:0 -c:v libx264 -crf 32 -preset ultrafast ` +
+      `ffmpeg -y -f concat -safe 0 -i ${concatFile} ` +
       `-vf "tpad=stop_mode=clone:stop_duration=30" ` +
-      `-c:a aac -b:a 96k ` +
+      `-c:v libx264 -crf 32 -preset ultrafast ` +
+      `${tmp}/video_padded.mp4`,
+      { timeout: 180000, stdio: 'pipe' }
+    )
+
+    // Vaihe 2: yhdista padded video + audio
+    console.log(`[merge] vaihe 2 — yhdista audio...`)
+    execSync(
+      `ffmpeg -y -i ${tmp}/video_padded.mp4 -i ${tmp}/audio.mp3 ` +
+      `-map 0:v -map 1:a ` +
+      `-c:v copy -c:a aac -b:a 96k -shortest ` +
       `${tmp}/final.mp4`,
-      { timeout: 300000, stdio: 'pipe' }
+      { timeout: 120000, stdio: 'pipe' }
     )
 
     const finalSize = (fs.statSync(`${tmp}/final.mp4`).size / 1024 / 1024).toFixed(1)
