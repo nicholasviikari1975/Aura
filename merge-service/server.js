@@ -29,13 +29,27 @@ async function uploadToSupabase(filePath, storagePath) {
   const fileSize = fs.statSync(filePath).size
   const sizeMB = (fileSize / 1024 / 1024).toFixed(1)
   console.log(`[upload] ${storagePath} — ${sizeMB} MB`)
+
   const buffer = fs.readFileSync(filePath)
-  const { error } = await sb.storage
-    .from('aura-videos')
-    .upload(storagePath, buffer, { contentType: 'video/mp4', upsert: true })
-  if (error) throw new Error('Storage upload: ' + error.message)
-  const { data: { publicUrl } } = sb.storage.from('aura-videos').getPublicUrl(storagePath)
-  return publicUrl
+
+  const url = `${SUPABASE_URL}/storage/v1/object/aura-videos/${storagePath}`
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'video/mp4',
+      'x-upsert': 'true',
+      'Content-Length': String(buffer.length),
+    },
+    body: buffer,
+  })
+
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error('Storage upload: ' + err)
+  }
+
+  return `${SUPABASE_URL}/storage/v1/object/public/aura-videos/${storagePath}`
 }
 
 app.use((req, res, next) => {
@@ -96,7 +110,7 @@ app.post('/merge', async (req, res) => {
     await sb.from('video_jobs').update({
       status: 'done',
       updated_at: new Date().toISOString()
-    }).eq('id', job_id).catch(() => {})
+    }).eq('id', job_id)
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
   }
