@@ -59,17 +59,22 @@ app.post('/merge', async (req, res) => {
 
   try {
     console.log(`[merge] START job ${job_id} — ${clip_urls.length} clips`)
-    await Promise.all(clip_urls.map((url, i) => download(url, `${tmp}/clip${i}.mp4`)))
+
+    for (let i = 0; i < clip_urls.length; i++) {
+      await download(clip_urls[i], `${tmp}/clip${i}.mp4`)
+      console.log(`[merge] clip ${i + 1}/${clip_urls.length} ladattu`)
+    }
+
     await download(audio_url, `${tmp}/audio.mp3`)
+    console.log(`[merge] audio ladattu`)
 
     const concatFile = `${tmp}/concat.txt`
     fs.writeFileSync(concatFile, clip_urls.map((_, i) => `file '${tmp}/clip${i}.mp4'`).join('\n'))
 
-    console.log(`[merge] running ffmpeg...`)
+    console.log(`[merge] running ffmpeg (stream copy)...`)
     execSync(
       `ffmpeg -y -f concat -safe 0 -i ${concatFile} -i ${tmp}/audio.mp3 ` +
-      `-map 0:v:0 -map 1:a:0 -c:v libx264 -crf 28 -preset ultrafast ` +
-      `-c:a aac -b:a 96k -shortest ${tmp}/final.mp4`,
+      `-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 96k -shortest ${tmp}/final.mp4`,
       { timeout: 300000, stdio: 'pipe' }
     )
 
