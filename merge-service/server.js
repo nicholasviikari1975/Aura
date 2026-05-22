@@ -81,11 +81,13 @@ app.post('/merge', async (req, res) => {
     const concatFile = `${tmp}/concat.txt`
     fs.writeFileSync(concatFile, clip_urls.map((_, i) => `file '${tmp}/clip${i}.mp4'`).join('\n'))
 
-    console.log(`[merge] running ffmpeg (h264 crf32)...`)
+    console.log(`[merge] running ffmpeg...`)
     execSync(
       `ffmpeg -y -f concat -safe 0 -i ${concatFile} -i ${tmp}/audio.mp3 ` +
       `-map 0:v:0 -map 1:a:0 -c:v libx264 -crf 32 -preset ultrafast ` +
-      `-c:a aac -b:a 96k -shortest ${tmp}/final.mp4`,
+      `-vf "tpad=stop_mode=clone:stop_duration=15" ` +
+      `-c:a aac -b:a 96k ` +
+      `${tmp}/final.mp4`,
       { timeout: 300000, stdio: 'pipe' }
     )
 
