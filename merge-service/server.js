@@ -48,22 +48,6 @@ async function uploadToSupabase(filePath, storagePath) {
   return `${SUPABASE_URL}/storage/v1/object/public/aura-videos/${storagePath}`
 }
 
-function getDuration(filePath) {
-  try {
-    // ffmpeg kirjoittaa Duration stderr:iin ja palauttaa exit code 1
-    execSync(`ffmpeg -i "${filePath}" 2>/dev/null`, { stdio: 'pipe' })
-  } catch (e) {
-    try {
-      const stderr = e.stderr?.toString() || ''
-      const match = stderr.match(/Duration: (\d+):(\d+):(\d+\.?\d*)/)
-      if (match) {
-        return parseInt(match[1]) * 3600 + parseInt(match[2]) * 60 + parseFloat(match[3])
-      }
-    } catch {}
-  }
-  return 0
-}
-
 app.use((req, res, next) => {
   const auth = req.headers.authorization
   if (!auth || auth !== 'Bearer ' + MERGE_API_KEY) {
@@ -94,14 +78,12 @@ app.post('/merge', async (req, res) => {
     await download(audio_url, `${tmp}/audio.mp3`)
     console.log(`[merge] audio ladattu`)
 
-    // Laske kestot
-    const audioDuration = getDuration(`${tmp}/audio.mp3`)
-    const videoDuration = clip_urls.length * 5
-    const padNeeded = Math.max(10, Math.ceil(audioDuration - videoDuration) + 5)
-    console.log(`[merge] audio: ${audioDuration.toFixed(1)}s, video: ${videoDuration}s, pad: ${padNeeded}s`)
-
     const concatFile = `${tmp}/concat.txt`
     fs.writeFileSync(concatFile, clip_urls.map((_, i) => `file '${tmp}/clip${i}.mp4'`).join('\n'))
+
+    // Kiintea 25s pad — 7 klippia x 5s = 35s + 25s = 60s, riittaa 45s audiolle
+    const padNeeded = 25
+    console.log(`[merge] video: ${clip_urls.length * 5}s + pad: ${padNeeded}s`)
 
     // Vaihe 1: yhdista klipsit + freeze-frame
     console.log(`[merge] vaihe 1 — concat + tpad ${padNeeded}s...`)
@@ -113,7 +95,7 @@ app.post('/merge', async (req, res) => {
       { timeout: 180000, stdio: 'pipe' }
     )
 
-    // Vaihe 2: yhdista video + audio
+    // Vaihe 2: yhdista video + audio — -shortest leikkaa audion loppuessa
     console.log(`[merge] vaihe 2 — yhdista audio...`)
     execSync(
       `ffmpeg -y -i ${tmp}/video_padded.mp4 -i ${tmp}/audio.mp3 ` +
@@ -124,8 +106,7 @@ app.post('/merge', async (req, res) => {
     )
 
     const finalSize = (fs.statSync(`${tmp}/final.mp4`).size / 1024 / 1024).toFixed(1)
-    const finalDuration = getDuration(`${tmp}/final.mp4`)
-    console.log(`[merge] ffmpeg done — ${finalSize} MB, ${finalDuration.toFixed(1)}s`)
+    console.log(`[merge] ffmpeg done — ${finalSize} MB`)
 
     const storagePath = `merged/job_${job_id}_final.mp4`
     const publicUrl = await uploadToSupabase(`${tmp}/final.mp4`, storagePath)
