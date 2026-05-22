@@ -3,6 +3,7 @@ const { execSync } = require('child_process')
 const fs = require('fs')
 const https = require('https')
 const http = require('http')
+
 const app = express()
 app.use(express.json({ limit: '10mb' }))
 
@@ -22,40 +23,26 @@ async function download(url, dest) {
 }
 
 async function uploadToSupabase(filePath, storagePath) {
-  // Luo signed upload URL
-  const signRes = await fetch(
-    `${SUPABASE_URL}/storage/v1/object/upload/sign/aura-videos/${storagePath}`,
+  const buffer = fs.readFileSync(filePath)
+  const sizeMB = (buffer.length / 1024 / 1024).toFixed(1)
+  console.log(`[upload] ${storagePath} — ${sizeMB} MB`)
+
+  const res = await fetch(
+    `${SUPABASE_URL}/storage/v1/object/aura-videos/${storagePath}`,
     {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${SUPABASE_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ upsert: true }),
-    }
-  )
-  if (!signRes.ok) {
-    const err = await signRes.text()
-    throw new Error('Signed URL luonti epäonnistui: ' + err)
-  }
-  const { url: signedUrl, token } = await signRes.json()
-
-  // Lataa tiedosto signed URL:iin
-  const buffer = fs.readFileSync(filePath)
-  const uploadRes = await fetch(
-    `${SUPABASE_URL}/storage/v1/object/upload/sign/aura-videos/${storagePath}?token=${token}`,
-    {
-      method: 'PUT',
-      headers: {
         'Content-Type': 'video/mp4',
-        'Content-Length': buffer.length,
+        'x-upsert': 'true',
       },
       body: buffer,
     }
   )
-  if (!uploadRes.ok) {
-    const err = await uploadRes.text()
-    throw new Error('Upload epäonnistui: ' + err)
+
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error('Storage upload: ' + err)
   }
 
   return `${SUPABASE_URL}/storage/v1/object/public/aura-videos/${storagePath}`
@@ -74,24 +61,47 @@ app.post('/merge', async (req, res) => {
   if (!job_id || !clip_urls?.length || !audio_url) {
     return res.status(400).json({ ok: false, error: 'job_id, clip_urls, audio_url vaaditaan' })
   }
+
   const tmp = `/tmp/job_${job_id}`
   fs.mkdirSync(tmp, { recursive: true })
+
   try {
     console.log(`[merge] job ${job_id} — ${clip_urls.length} clips`)
-    await Promise.all(clip_urls.map((url, i) => download(url, `${tmp}/clip${i}.mp4`)))
+
+    // Lataa klipsit rinnakkain
+    await Promise.all(
+      clip_urls.map((url, i) => download(url, `${tmp}/clip${i}.mp4`))
+    )
     await download(audio_url, `${tmp}/audio.mp3`)
 
+    // Luo concat-lista
     const concatFile = `${tmp}/concat.txt`
-    fs.writeFileSync(concatFile, clip_urls.map((_, i) => `file '${tmp}/clip${i}.mp4'`).join('\n'))
+    fs.writeFileSync(
+      concatFile,
+      clip_urls.map((_, i) => `file '${tmp}/clip${i}.mp4'`).join('\n')
+    )
 
-    execSync(`ffmpeg -y -f concat -safe 0 -i ${concatFile} -c copy ${tmp}/merged.mp4`)
-    execSync(`ffmpeg -y -i ${tmp}/merged.mp4 -i ${tmp}/audio.mp3 -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -shortest ${tmp}/final.mp4`)
+    // FFmpeg: konkatenoi + lisää audio + kompressoi (CRF 28, ~25-40 MB)
+    console.log(`[merge] running ffmpeg...`)
+    execSync(
+      `ffmpeg -y -f concat -safe 0 -i ${concatFile} -i ${tmp}/audio.mp3 ` +
+      `-map 0:v:0 -map 1:a:0 ` +
+      `-c:v libx264 -crf 28 -preset fast ` +
+      `-c:a aac -b:a 128k ` +
+      `-shortest ${tmp}/final.mp4`,
+      { timeout: 300000 }
+    )
 
+    const finalSize = (fs.statSync(`${tmp}/final.mp4`).size / 1024 / 1024).toFixed(1)
+    console.log(`[merge] ffmpeg done — ${finalSize} MB`)
+
+    // Upload Supabaseen
     const storagePath = `merged/job_${job_id}_final.mp4`
     const publicUrl = await uploadToSupabase(`${tmp}/final.mp4`, storagePath)
 
     console.log(`[merge] done — ${publicUrl}`)
     res.json({ ok: true, merged_url: publicUrl })
+
   } catch (err) {
     console.error('[merge] error:', err.message)
     res.status(500).json({ ok: false, error: err.message })
@@ -101,4 +111,7 @@ app.post('/merge', async (req, res) => {
 })
 
 app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge service running'))
+
+app.listen(process.env.PORT || 3000, () => {
+  console.log(`Merge service running on port ${process.env.PORT || 3000}`)
+})
