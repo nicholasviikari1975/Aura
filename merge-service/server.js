@@ -50,16 +50,16 @@ async function uploadToSupabase(filePath, storagePath) {
 
 function getDuration(filePath) {
   try {
-    const out = execSync(
-      `ffprobe -v quiet -print_format json -show_streams "${filePath}"`,
-      { stdio: ['pipe', 'pipe', 'pipe'] }
-    ).toString()
-    const streams = JSON.parse(out).streams
-    for (const s of streams) {
-      if (s.duration) return parseFloat(s.duration)
-    }
+    // ffmpeg kirjoittaa Duration stderr:iin ja palauttaa exit code 1
+    execSync(`ffmpeg -i "${filePath}" 2>/dev/null`, { stdio: 'pipe' })
   } catch (e) {
-    console.log(`[duration] error: ${e.message}`)
+    try {
+      const stderr = e.stderr?.toString() || ''
+      const match = stderr.match(/Duration: (\d+):(\d+):(\d+\.?\d*)/)
+      if (match) {
+        return parseInt(match[1]) * 3600 + parseInt(match[2]) * 60 + parseFloat(match[3])
+      }
+    } catch {}
   }
   return 0
 }
@@ -94,16 +94,16 @@ app.post('/merge', async (req, res) => {
     await download(audio_url, `${tmp}/audio.mp3`)
     console.log(`[merge] audio ladattu`)
 
+    // Laske kestot
+    const audioDuration = getDuration(`${tmp}/audio.mp3`)
+    const videoDuration = clip_urls.length * 5
+    const padNeeded = Math.max(10, Math.ceil(audioDuration - videoDuration) + 5)
+    console.log(`[merge] audio: ${audioDuration.toFixed(1)}s, video: ${videoDuration}s, pad: ${padNeeded}s`)
+
     const concatFile = `${tmp}/concat.txt`
     fs.writeFileSync(concatFile, clip_urls.map((_, i) => `file '${tmp}/clip${i}.mp4'`).join('\n'))
 
-    // Laske audion ja videon kestot
-    const audioDuration = getDuration(`${tmp}/audio.mp3`)
-    const videoDuration = clip_urls.length * 5 // 5s per clip
-    const padNeeded = Math.max(0, Math.ceil(audioDuration - videoDuration) + 3) // +3s buffer
-    console.log(`[merge] audio: ${audioDuration.toFixed(1)}s, video: ${videoDuration}s, pad: ${padNeeded}s`)
-
-    // Vaihe 1: yhdista klipsit + lisaa freeze-frame
+    // Vaihe 1: yhdista klipsit + freeze-frame
     console.log(`[merge] vaihe 1 — concat + tpad ${padNeeded}s...`)
     execSync(
       `ffmpeg -y -f concat -safe 0 -i ${concatFile} ` +
@@ -113,7 +113,7 @@ app.post('/merge', async (req, res) => {
       { timeout: 180000, stdio: 'pipe' }
     )
 
-    // Vaihe 2: yhdista padded video + audio — video on nyt pidempi kuin audio
+    // Vaihe 2: yhdista video + audio
     console.log(`[merge] vaihe 2 — yhdista audio...`)
     execSync(
       `ffmpeg -y -i ${tmp}/video_padded.mp4 -i ${tmp}/audio.mp3 ` +
