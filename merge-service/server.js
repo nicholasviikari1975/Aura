@@ -29,9 +29,7 @@ async function uploadToSupabase(filePath, storagePath) {
   const fileSize = fs.statSync(filePath).size
   const sizeMB = (fileSize / 1024 / 1024).toFixed(1)
   console.log(`[upload] ${storagePath} — ${sizeMB} MB`)
-
   const buffer = fs.readFileSync(filePath)
-
   const url = `${SUPABASE_URL}/storage/v1/object/aura-videos/${storagePath}`
   const res = await fetch(url, {
     method: 'POST',
@@ -43,12 +41,10 @@ async function uploadToSupabase(filePath, storagePath) {
     },
     body: buffer,
   })
-
   if (!res.ok) {
     const err = await res.text()
     throw new Error('Storage upload: ' + err)
   }
-
   return `${SUPABASE_URL}/storage/v1/object/public/aura-videos/${storagePath}`
 }
 
@@ -85,10 +81,11 @@ app.post('/merge', async (req, res) => {
     const concatFile = `${tmp}/concat.txt`
     fs.writeFileSync(concatFile, clip_urls.map((_, i) => `file '${tmp}/clip${i}.mp4'`).join('\n'))
 
-    console.log(`[merge] running ffmpeg (stream copy)...`)
+    console.log(`[merge] running ffmpeg (h264 crf32)...`)
     execSync(
       `ffmpeg -y -f concat -safe 0 -i ${concatFile} -i ${tmp}/audio.mp3 ` +
-      `-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 96k -shortest ${tmp}/final.mp4`,
+      `-map 0:v:0 -map 1:a:0 -c:v libx264 -crf 32 -preset ultrafast ` +
+      `-c:a aac -b:a 96k -shortest ${tmp}/final.mp4`,
       { timeout: 300000, stdio: 'pipe' }
     )
 
