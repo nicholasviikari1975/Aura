@@ -15,7 +15,7 @@ async function download(url, dest) {
     const file = fs.createWriteStream(dest)
     const get = url.startsWith('https') ? https.get : http.get
     const req = get(url, res => {
-      if (res.statusCode !== 200) { file.close(); fs.unlinkSync(dest); return reject(new Error(`HTTP ${res.statusCode} for ${url}`)) }
+      if (res.statusCode !== 200) { file.close(); fs.unlinkSync(dest); return reject(new Error(`HTTP ${res.statusCode}`)) }
       res.pipe(file)
       file.on('finish', () => { file.close(); resolve() })
     })
@@ -23,20 +23,16 @@ async function download(url, dest) {
   })
 }
 async function uploadToSupabase(filePath, storagePath) {
-  const stat = fs.statSync(filePath)
-  const sizeMB = (stat.size / 1024 / 1024).toFixed(1)
+  const sizeMB = (fs.statSync(filePath).size / 1024 / 1024).toFixed(1)
   console.log(`[upload] ${storagePath} — ${sizeMB} MB`)
-  if (stat.size > 45 * 1024 * 1024) throw new Error(`File too large: ${sizeMB} MB (max 45 MB)`)
-  const fileStream = fs.createReadStream(filePath)
-  const chunks = []
-  for await (const chunk of fileStream) chunks.push(chunk)
-  const buffer = Buffer.concat(chunks)
+  if (fs.statSync(filePath).size > 45 * 1024 * 1024) throw new Error(`File too large: ${sizeMB} MB`)
+  const buffer = fs.readFileSync(filePath)
   const res = await fetch(`${SUPABASE_URL}/storage/v1/object/aura-videos/${storagePath}`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'video/mp4', 'x-upsert': 'true', 'Content-Length': String(buffer.length) },
     body: buffer,
   })
-  if (!res.ok) throw new Error(`Storage: ${await res.text()}`)
+  if (!res.ok) throw new Error('Storage: ' + await res.text())
   return `${SUPABASE_URL}/storage/v1/object/public/aura-videos/${storagePath}`
 }
 app.use((req, res, next) => {
@@ -65,7 +61,8 @@ app.post('/merge', async (req, res) => {
     console.log(`[merge] concat: ${lines.length} clips`)
     execSync(
       `ffmpeg -y -f concat -safe 0 -i ${tmp}/concat.txt -i ${tmp}/audio.mp3 ` +
-      `-map 0:v -map 1:a -vf "scale=1080:-2" -c:v libx264 -crf 28 -preset fast ` +
+      `-map 0:v -map 1:a -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2" ` +
+      `-c:v libx264 -crf 32 -preset ultrafast -tune fastdecode ` +
       `-c:a aac -b:a 128k -shortest ${tmp}/final.mp4`,
       { timeout: 300000, stdio: 'pipe' }
     )
@@ -81,5 +78,5 @@ app.post('/merge', async (req, res) => {
     try { fs.rmSync(tmp, { recursive: true, force: true }) } catch(e) {}
   }
 })
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v41' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v41 running on port ' + (process.env.PORT || 3000)))
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v42' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v42 running on port ' + (process.env.PORT || 3000)))
