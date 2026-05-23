@@ -68,15 +68,10 @@ app.post('/merge', async (req, res) => {
     await download(audio_url, `${tmp}/audio.mp3`)
     console.log(`[merge] audio ok`)
 
-    // Viimeinen klippi x5 extra = 25s lisaa
-    const lines = [
-      ...clip_urls.map((_, i) => `file '${tmp}/clip${i}.mp4'`),
-      ...Array(5).fill(`file '${tmp}/clip${clip_urls.length-1}.mp4'`)
-    ]
+    const lines = clip_urls.map((_, i) => `file '${tmp}/clip${i}.mp4'`)
     fs.writeFileSync(`${tmp}/concat.txt`, lines.join('\n'))
     console.log(`[merge] concat: ${lines.length} klippia`)
 
-    // 720p + crf35 — alle 30MB, ei muistiongelmia
     execSync(
       `ffmpeg -y -f concat -safe 0 -i ${tmp}/concat.txt -i ${tmp}/audio.mp3 ` +
       `-map 0:v -map 1:a ` +
