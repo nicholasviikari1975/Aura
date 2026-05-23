@@ -1,5 +1,5 @@
 const express = require('express')
-const { execSync } = require('child_process')
+const { execSync, spawnSync } = require('child_process')
 const { createClient } = require('@supabase/supabase-js')
 const fs = require('fs')
 const https = require('https')
@@ -11,7 +11,6 @@ app.use(express.json({ limit: '10mb' }))
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
 const MERGE_API_KEY = process.env.MERGE_API_KEY
-
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY)
 
 async function download(url, dest) {
@@ -26,12 +25,10 @@ async function download(url, dest) {
 }
 
 async function uploadToSupabase(filePath, storagePath) {
-  const fileSize = fs.statSync(filePath).size
-  const sizeMB = (fileSize / 1024 / 1024).toFixed(1)
+  const sizeMB = (fs.statSync(filePath).size / 1024 / 1024).toFixed(1)
   console.log(`[upload] ${storagePath} — ${sizeMB} MB`)
   const buffer = fs.readFileSync(filePath)
-  const url = `${SUPABASE_URL}/storage/v1/object/aura-videos/${storagePath}`
-  const res = await fetch(url, {
+  const res = await fetch(`${SUPABASE_URL}/storage/v1/object/aura-videos/${storagePath}`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${SUPABASE_KEY}`,
@@ -41,26 +38,20 @@ async function uploadToSupabase(filePath, storagePath) {
     },
     body: buffer,
   })
-  if (!res.ok) {
-    const err = await res.text()
-    throw new Error('Storage upload: ' + err)
-  }
+  if (!res.ok) throw new Error('Storage: ' + await res.text())
   return `${SUPABASE_URL}/storage/v1/object/public/aura-videos/${storagePath}`
 }
 
 app.use((req, res, next) => {
-  const auth = req.headers.authorization
-  if (!auth || auth !== 'Bearer ' + MERGE_API_KEY) {
+  if (req.headers.authorization !== 'Bearer ' + MERGE_API_KEY)
     return res.status(401).json({ ok: false, error: 'Unauthorized' })
-  }
   next()
 })
 
 app.post('/merge', async (req, res) => {
   const { job_id, clip_urls, audio_url } = req.body
-  if (!job_id || !clip_urls?.length || !audio_url) {
-    return res.status(400).json({ ok: false, error: 'job_id, clip_urls, audio_url vaaditaan' })
-  }
+  if (!job_id || !clip_urls?.length || !audio_url)
+    return res.status(400).json({ ok: false, error: 'Parametrit puuttuu' })
 
   res.status(202).json({ ok: true, job_id, status: 'processing' })
 
@@ -68,55 +59,40 @@ app.post('/merge', async (req, res) => {
   fs.mkdirSync(tmp, { recursive: true })
 
   try {
-    console.log(`[merge] START job ${job_id} — ${clip_urls.length} clips`)
+    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips`)
 
+    // Lataa klipsit yksitellen — ei pideta muistissa
     for (let i = 0; i < clip_urls.length; i++) {
       await download(clip_urls[i], `${tmp}/clip${i}.mp4`)
-      console.log(`[merge] clip ${i + 1}/${clip_urls.length} ladattu`)
+      console.log(`[merge] clip ${i+1}/${clip_urls.length}`)
     }
-
     await download(audio_url, `${tmp}/audio.mp3`)
-    console.log(`[merge] audio ladattu`)
+    console.log(`[merge] audio ok`)
 
-    // Toista viimeinen klippi 5 kertaa (5 x 5s = 25s extra)
-    // 7 klippia x 5s = 35s + 25s = 60s — riittaa 45s audiolle
-    const lastClip = `${tmp}/clip${clip_urls.length - 1}.mp4`
-    const allClipLines = [
+    // Viimeinen klippi x5 extra = 25s lisaa
+    const lines = [
       ...clip_urls.map((_, i) => `file '${tmp}/clip${i}.mp4'`),
-      ...Array(5).fill(`file '${lastClip}'`)
+      ...Array(5).fill(`file '${tmp}/clip${clip_urls.length-1}.mp4'`)
     ]
+    fs.writeFileSync(`${tmp}/concat.txt`, lines.join('\n'))
+    console.log(`[merge] concat: ${lines.length} klippia`)
 
-    const concatFile = `${tmp}/concat.txt`
-    fs.writeFileSync(concatFile, allClipLines.join('\n'))
-    console.log(`[merge] concat: ${allClipLines.length} klippia (${allClipLines.length * 5}s)`)
-
-    console.log(`[merge] running ffmpeg...`)
+    // Yhta FFmpeg-komentoa — stream copy videosta, enkoodaa vain audio
     execSync(
-      `ffmpeg -y -f concat -safe 0 -i ${concatFile} -i ${tmp}/audio.mp3 ` +
-      `-map 0:v -map 1:a -c:v libx264 -crf 32 -preset ultrafast ` +
-      `-c:a aac -b:a 96k -shortest ${tmp}/final.mp4`,
+      `ffmpeg -y -f concat -safe 0 -i ${tmp}/concat.txt -i ${tmp}/audio.mp3 ` +
+      `-map 0:v -map 1:a -c:v copy -c:a aac -b:a 96k -shortest ${tmp}/final.mp4`,
       { timeout: 300000, stdio: 'pipe' }
     )
 
-    const finalSize = (fs.statSync(`${tmp}/final.mp4`).size / 1024 / 1024).toFixed(1)
-    console.log(`[merge] ffmpeg done — ${finalSize} MB`)
+    const sizeMB = (fs.statSync(`${tmp}/final.mp4`).size / 1024 / 1024).toFixed(1)
+    console.log(`[merge] done — ${sizeMB} MB`)
 
-    const storagePath = `merged/job_${job_id}_final.mp4`
-    const publicUrl = await uploadToSupabase(`${tmp}/final.mp4`, storagePath)
-
-    await sb.from('video_jobs').update({
-      status: 'merged',
-      merged_video_url: publicUrl,
-      updated_at: new Date().toISOString()
-    }).eq('id', job_id)
-
-    console.log(`[merge] DONE — ${publicUrl}`)
+    const url = await uploadToSupabase(`${tmp}/final.mp4`, `merged/job_${job_id}_final.mp4`)
+    await sb.from('video_jobs').update({ status: 'merged', merged_video_url: url, updated_at: new Date().toISOString() }).eq('id', job_id)
+    console.log(`[merge] DONE — ${url}`)
   } catch (err) {
-    console.error(`[merge] ERROR job ${job_id}:`, err.message)
-    await sb.from('video_jobs').update({
-      status: 'done',
-      updated_at: new Date().toISOString()
-    }).eq('id', job_id)
+    console.error(`[merge] ERROR:`, err.message)
+    await sb.from('video_jobs').update({ status: 'done', updated_at: new Date().toISOString() }).eq('id', job_id)
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
   }
@@ -124,6 +100,4 @@ app.post('/merge', async (req, res) => {
 
 app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge' }))
 
-app.listen(process.env.PORT || 3000, () => {
-  console.log(`Merge service running on port ${process.env.PORT || 3000}`)
-})
+app.listen(process.env.PORT || 3000, () => console.log(`Merge running on port ${process.env.PORT || 3000}`))
