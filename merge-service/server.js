@@ -1,5 +1,5 @@
 const express = require('express')
-const { execSync, spawnSync } = require('child_process')
+const { execSync } = require('child_process')
 const { createClient } = require('@supabase/supabase-js')
 const fs = require('fs')
 const https = require('https')
@@ -61,7 +61,6 @@ app.post('/merge', async (req, res) => {
   try {
     console.log(`[merge] START ${job_id} — ${clip_urls.length} clips`)
 
-    // Lataa klipsit yksitellen — ei pideta muistissa
     for (let i = 0; i < clip_urls.length; i++) {
       await download(clip_urls[i], `${tmp}/clip${i}.mp4`)
       console.log(`[merge] clip ${i+1}/${clip_urls.length}`)
@@ -77,10 +76,12 @@ app.post('/merge', async (req, res) => {
     fs.writeFileSync(`${tmp}/concat.txt`, lines.join('\n'))
     console.log(`[merge] concat: ${lines.length} klippia`)
 
-    // Yhta FFmpeg-komentoa — stream copy videosta, enkoodaa vain audio
+    // 720p + crf35 — alle 30MB, ei muistiongelmia
     execSync(
       `ffmpeg -y -f concat -safe 0 -i ${tmp}/concat.txt -i ${tmp}/audio.mp3 ` +
-      `-map 0:v -map 1:a -c:v copy -c:a aac -b:a 96k -shortest ${tmp}/final.mp4`,
+      `-map 0:v -map 1:a ` +
+      `-vf "scale=720:-2" -c:v libx264 -crf 35 -preset ultrafast ` +
+      `-c:a aac -b:a 96k -shortest ${tmp}/final.mp4`,
       { timeout: 300000, stdio: 'pipe' }
     )
 
