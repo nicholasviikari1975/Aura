@@ -190,5 +190,50 @@ app.post('/split-audio', async (req, res) => {
   }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v44' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v44 running on port ' + (process.env.PORT || 3000)))
+
+// ============================================================
+// POST /search — Brave Search proxy
+// ============================================================
+app.post('/search', async (req, res) => {
+  const { query, count = 4 } = req.body
+  if (!query) return res.status(400).json({ ok: false, error: 'query vaaditaan' })
+
+  const braveKey = process.env.BRAVE_SEARCH_API_KEY
+  if (!braveKey) return res.status(500).json({ ok: false, error: 'BRAVE_SEARCH_API_KEY puuttuu' })
+
+  try {
+    console.log(`[search] query: ${query}`)
+    const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}&search_lang=en&freshness=pm`
+    const response = await fetch(url, {
+      headers: {
+        'Accept': 'application/json',
+        'Accept-Encoding': 'gzip',
+        'X-Subscription-Token': braveKey
+      }
+    })
+
+    if (!response.ok) {
+      const err = await response.text()
+      console.error(`[search] error: ${response.status} ${err.slice(0, 200)}`)
+      return res.status(response.status).json({ ok: false, error: err.slice(0, 200) })
+    }
+
+    const data = await response.json()
+    const results = data?.web?.results || []
+    const facts = results
+      .slice(0, count)
+      .map(r => r.description || r.extra_snippets?.[0] || '')
+      .filter(s => s.length > 20)
+      .join(' | ')
+
+    console.log(`[search] ok — ${results.length} results, facts: ${facts.length} chars`)
+    res.json({ ok: true, facts, results_count: results.length })
+
+  } catch (err) {
+    console.error(`[search] exception: ${err.message}`)
+    res.status(500).json({ ok: false, error: err.message })
+  }
+})
+
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v45' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v45 running on port ' + (process.env.PORT || 3000)))
