@@ -198,55 +198,60 @@ app.post('/search', async (req, res) => {
   const { query, count = 4 } = req.body
   if (!query) return res.status(400).json({ ok: false, error: 'query vaaditaan' })
 
-  const braveKey = process.env.BRAVE_SEARCH_API_KEY
-  if (!braveKey) return res.status(500).json({ ok: false, error: 'BRAVE_SEARCH_API_KEY puuttuu' })
+  const searchKey = process.env.BRAVE_SEARCH_API_KEY
+  const answersKey = process.env.BRAVE_ANSWERS_API_KEY
+
+  if (!searchKey && !answersKey) return res.status(500).json({ ok: false, error: 'Brave API keys puuttuvat' })
 
   try {
     console.log(`[search] query: ${query}`)
-    // Brave Answers API
-    const url = `https://api.search.brave.com/res/v1/summarizer/search?q=${encodeURIComponent(query)}&count=${count}&key=${braveKey}`
-    console.log(`[search] calling answers api: ${url.slice(0, 100)}`)
-    
-    const response = await fetch(url, {
-      headers: {
-        'Accept': 'application/json',
-        'Accept-Encoding': 'gzip',
-        'X-Subscription-Token': braveKey
+
+    // Yritä ensin Web Search (Search key)
+    if (searchKey) {
+      const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}&search_lang=en`
+      console.log(`[search] web search: ${url.slice(0, 100)}`)
+      const response = await fetch(url, {
+        headers: {
+          'Accept': 'application/json',
+          'Accept-Encoding': 'gzip',
+          'X-Subscription-Token': searchKey
+        }
+      })
+      console.log(`[search] web status: ${response.status}`)
+      if (response.ok) {
+        const data = await response.json()
+        const results = data?.web?.results || []
+        const facts = results.slice(0, count).map(r => r.description || r.extra_snippets?.[0] || '').filter(s => s.length > 20).join(' | ')
+        console.log(`[search] web ok — ${results.length} results, ${facts.length} chars`)
+        if (facts.length > 0) return res.json({ ok: true, facts, results_count: results.length, source: 'web' })
+        console.log('[search] web returned empty facts, trying answers...')
       }
-    })
+    }
 
-    console.log(`[search] status: ${response.status}`)
-
-    if (!response.ok) {
-      const err = await response.text()
-      console.error(`[search] error: ${response.status} ${err.slice(0, 300)}`)
-      
-      // Fallback: try web search with different subscription
-      console.log('[search] trying web search fallback...')
-      const url2 = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}&search_lang=en`
+    // Fallback: Answers API
+    if (answersKey) {
+      const url2 = `https://api.search.brave.com/res/v1/summarizer/search?q=${encodeURIComponent(query)}&count=${count}&key=${answersKey}`
+      console.log(`[search] answers api: ${url2.slice(0, 100)}`)
       const res2 = await fetch(url2, {
         headers: {
           'Accept': 'application/json',
-          'X-Subscription-Token': braveKey
+          'Accept-Encoding': 'gzip',
+          'X-Subscription-Token': answersKey
         }
       })
+      console.log(`[search] answers status: ${res2.status}`)
       if (res2.ok) {
         const data2 = await res2.json()
-        const results2 = data2?.web?.results || []
-        const facts2 = results2.slice(0, count).map(r => r.description || '').filter(s => s.length > 20).join(' | ')
-        return res.json({ ok: true, facts: facts2, results_count: results2.length, source: 'web' })
+        const summary = (data2?.summary || []).map(s => s.text || '').filter(t => t.length > 10).join(' ')
+        const snippets = (data2?.results || []).slice(0, count).map(r => r.description || '').filter(s => s.length > 20).join(' | ')
+        const facts2 = [summary, snippets].filter(Boolean).join(' | ')
+        console.log(`[search] answers ok — ${facts2.length} chars`)
+        return res.json({ ok: true, facts: facts2, results_count: data2?.results?.length || 0, source: 'answers' })
       }
-      return res.status(response.status).json({ ok: false, error: err.slice(0, 200) })
     }
 
-    const data = await response.json()
-    // Answers API response structure
-    const summary = (data?.summary || []).map(s => s.text || '').filter(t => t.length > 10).join(' ')
-    const snippets = (data?.results || []).slice(0, count).map(r => r.description || '').filter(s => s.length > 20).join(' | ')
-    const facts = [summary, snippets].filter(Boolean).join(' | ')
-
-    console.log(`[search] answers ok — summary: ${summary.length} chars, snippets: ${snippets.length} chars`)
-    res.json({ ok: true, facts, results_count: data?.results?.length || 0, source: 'answers' })
+    console.log('[search] both APIs failed or returned empty')
+    res.json({ ok: true, facts: '', results_count: 0, source: 'none' })
 
   } catch (err) {
     console.error(`[search] exception: ${err.message}`)
@@ -254,5 +259,5 @@ app.post('/search', async (req, res) => {
   }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v48' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v48 running on port ' + (process.env.PORT || 3000)))
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v49' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v49 running on port ' + (process.env.PORT || 3000)))
