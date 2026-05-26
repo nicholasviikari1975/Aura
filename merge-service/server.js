@@ -204,7 +204,7 @@ app.post('/search', async (req, res) => {
   try {
     console.log(`[search] query: ${query}`)
     // Brave Answers API
-    const url = `https://api.search.brave.com/res/v1/summarizer/search?q=${encodeURIComponent(query)}&count=${count}`
+    const url = `https://api.search.brave.com/res/v1/summarizer/search?q=${encodeURIComponent(query)}&count=${count}&key=${braveKey}`
     console.log(`[search] calling answers api: ${url.slice(0, 100)}`)
     
     const response = await fetch(url, {
@@ -254,5 +254,5 @@ app.post('/search', async (req, res) => {
   }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v47' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v47 running on port ' + (process.env.PORT || 3000)))
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v48' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v48 running on port ' + (process.env.PORT || 3000)))
