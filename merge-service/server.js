@@ -203,7 +203,10 @@ app.post('/search', async (req, res) => {
 
   try {
     console.log(`[search] query: ${query}`)
-    const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}&search_lang=en`
+    // Brave Answers API
+    const url = `https://api.search.brave.com/res/v1/summarizer/search?q=${encodeURIComponent(query)}&count=${count}`
+    console.log(`[search] calling answers api: ${url.slice(0, 100)}`)
+    
     const response = await fetch(url, {
       headers: {
         'Accept': 'application/json',
@@ -212,22 +215,38 @@ app.post('/search', async (req, res) => {
       }
     })
 
+    console.log(`[search] status: ${response.status}`)
+
     if (!response.ok) {
       const err = await response.text()
-      console.error(`[search] error: ${response.status} ${err.slice(0, 200)}`)
+      console.error(`[search] error: ${response.status} ${err.slice(0, 300)}`)
+      
+      // Fallback: try web search with different subscription
+      console.log('[search] trying web search fallback...')
+      const url2 = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}&search_lang=en`
+      const res2 = await fetch(url2, {
+        headers: {
+          'Accept': 'application/json',
+          'X-Subscription-Token': braveKey
+        }
+      })
+      if (res2.ok) {
+        const data2 = await res2.json()
+        const results2 = data2?.web?.results || []
+        const facts2 = results2.slice(0, count).map(r => r.description || '').filter(s => s.length > 20).join(' | ')
+        return res.json({ ok: true, facts: facts2, results_count: results2.length, source: 'web' })
+      }
       return res.status(response.status).json({ ok: false, error: err.slice(0, 200) })
     }
 
     const data = await response.json()
-    const results = data?.web?.results || []
-    const facts = results
-      .slice(0, count)
-      .map(r => r.description || r.extra_snippets?.[0] || '')
-      .filter(s => s.length > 20)
-      .join(' | ')
+    // Answers API response structure
+    const summary = (data?.summary || []).map(s => s.text || '').filter(t => t.length > 10).join(' ')
+    const snippets = (data?.results || []).slice(0, count).map(r => r.description || '').filter(s => s.length > 20).join(' | ')
+    const facts = [summary, snippets].filter(Boolean).join(' | ')
 
-    console.log(`[search] ok — ${results.length} results, facts: ${facts.length} chars`)
-    res.json({ ok: true, facts, results_count: results.length })
+    console.log(`[search] answers ok — summary: ${summary.length} chars, snippets: ${snippets.length} chars`)
+    res.json({ ok: true, facts, results_count: data?.results?.length || 0, source: 'answers' })
 
   } catch (err) {
     console.error(`[search] exception: ${err.message}`)
@@ -235,5 +254,5 @@ app.post('/search', async (req, res) => {
   }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v46' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v46 running on port ' + (process.env.PORT || 3000)))
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v47' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v47 running on port ' + (process.env.PORT || 3000)))
