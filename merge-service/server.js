@@ -65,6 +65,10 @@ app.use((req, res, next) => {
 
 // ============================================================
 // POST /merge — Yhdistä klippit + audio
+// v50 (8.6.2026): NORMALISOIVA merge. Kaikki klipit skaalataan
+// samaan 1080x1920 30fps -formaattiin ennen concatia. Korjaa:
+// lipsync- ja intro/outro-klipit (eri formaatti) rikkoivat
+// vanhan stream-copyn. Tukee vaihtelevan maaran klippeja.
 // ============================================================
 app.post('/merge', async (req, res) => {
   const { job_id, clip_urls, audio_url } = req.body
@@ -90,42 +94,30 @@ app.post('/merge', async (req, res) => {
     await download(audio_url, `${tmp}/audio.mp3`)
     console.log(`[merge] audio ok`)
 
-    // Check stream copy feasibility
-    let canStreamCopy = true
-    try {
-      const probeResults = []
-      for (let i = 0; i < clip_urls.length; i++) {
-        const probe = execSync(`ffprobe -v quiet -select_streams v:0 -show_entries stream=codec_name,width,height -of json ${tmp}/clip${i}.mp4`, { timeout: 10000 }).toString()
-        probeResults.push(JSON.parse(probe).streams[0])
-      }
-      const ref = probeResults[0]
-      for (const p of probeResults) {
-        if (p.codec_name !== ref.codec_name || p.width !== ref.width || p.height !== ref.height) { canStreamCopy = false; break }
-      }
-      console.log(`[merge] stream_copy=${canStreamCopy} (${ref.codec_name} ${ref.width}x${ref.height})`)
-    } catch (e) {
-      console.log(`[merge] probe failed, fallback: ${e.message}`)
-      canStreamCopy = false
+    // NORMALISOIVA concat-filter: jokainen klippi skaalataan + padataan
+    // samaan 1080x1920 30fps yuv420p -formaattiin. Eri lahteet
+    // (Seedance, pixverse-lipsync, intro/outro) yhdistyvat ongelmitta.
+    const inputs = clip_urls.map((_, i) => `-i ${tmp}/clip${i}.mp4`).join(' ')
+    const n = clip_urls.length
+    let filter = ''
+    for (let i = 0; i < n; i++) {
+      filter += `[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,` +
+                `pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,fps=30,setsar=1,format=yuv420p[v${i}];`
     }
+    for (let i = 0; i < n; i++) filter += `[v${i}]`
+    filter += `concat=n=${n}:v=1:a=0[outv]`
 
-    const lines = clip_urls.map((_, i) => `file '${tmp}/clip${i}.mp4'`)
-    fs.writeFileSync(`${tmp}/concat.txt`, lines.join('\n'))
-
-    if (canStreamCopy) {
-      execSync(`ffmpeg -y -f concat -safe 0 -i ${tmp}/concat.txt -c:v copy -an ${tmp}/video_only.mp4`, { timeout: 120000, stdio: 'pipe' })
-      execSync(`ffmpeg -y -i ${tmp}/video_only.mp4 -i ${tmp}/audio.mp3 -c:v copy -c:a aac -b:a 128k -shortest ${tmp}/final.mp4`, { timeout: 60000, stdio: 'pipe' })
-      console.log(`[merge] stream copy done`)
-    } else {
-      execSync(
-        `ffmpeg -y -f concat -safe 0 -i ${tmp}/concat.txt -i ${tmp}/audio.mp3 ` +
-        `-map 0:v -map 1:a -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2" ` +
-        `-c:v libx264 -crf 32 -preset ultrafast -tune fastdecode -c:a aac -b:a 128k -shortest ${tmp}/final.mp4`,
-        { timeout: 300000, stdio: 'pipe' }
-      )
-    }
+    execSync(
+      `ffmpeg -y ${inputs} -i ${tmp}/audio.mp3 ` +
+      `-filter_complex "${filter}" ` +
+      `-map "[outv]" -map ${n}:a ` +
+      `-c:v libx264 -preset fast -crf 20 -pix_fmt yuv420p ` +
+      `-c:a aac -b:a 192k -shortest -movflags +faststart ${tmp}/final.mp4`,
+      { timeout: 300000, stdio: 'pipe' }
+    )
 
     const sizeMB = (fs.statSync(`${tmp}/final.mp4`).size / 1024 / 1024).toFixed(1)
-    console.log(`[merge] final: ${sizeMB} MB (${canStreamCopy ? 'stream_copy' : 'transcode'})`)
+    console.log(`[merge] final: ${sizeMB} MB (normalized 1080p)`)
 
     const url = await uploadVideoToSupabase(`${tmp}/final.mp4`, `merged/job_${job_id}_final.mp4`)
     await sb.from('video_jobs').update({ status: 'merged', merged_video_url: url, updated_at: new Date().toISOString() }).eq('id', job_id)
@@ -163,7 +155,6 @@ app.post('/split-audio', async (req, res) => {
       const duration = end - start
       const dest = `${tmp}/shot${shot}.mp3`
 
-      // FFmpeg extract segment
       execSync(
         `ffmpeg -y -i ${tmp}/master.mp3 -ss ${start} -t ${duration} -c:a copy ${dest}`,
         { timeout: 30000, stdio: 'pipe' }
@@ -172,7 +163,6 @@ app.post('/split-audio', async (req, res) => {
       const size = fs.statSync(dest).size
       console.log(`[split] shot ${shot} ok (${(size/1024).toFixed(0)} KB, ${start}-${end}s)`)
 
-      // Upload to Supabase aura-audio bucket
       const storagePath = `segments/${script_id}_shot${shot}.mp3`
       const url = await uploadToSupabase(dest, storagePath)
 
@@ -190,7 +180,6 @@ app.post('/split-audio', async (req, res) => {
   }
 })
 
-
 // ============================================================
 // POST /search — Brave Search proxy
 // ============================================================
@@ -206,7 +195,6 @@ app.post('/search', async (req, res) => {
   try {
     console.log(`[search] query: ${query}`)
 
-    // Yritä ensin Web Search (Search key)
     if (searchKey) {
       const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}&search_lang=en`
       console.log(`[search] web search: ${url.slice(0, 100)}`)
@@ -228,7 +216,6 @@ app.post('/search', async (req, res) => {
       }
     }
 
-    // Fallback: Answers API
     if (answersKey) {
       const url2 = `https://api.search.brave.com/res/v1/summarizer/search?q=${encodeURIComponent(query)}&count=${count}&key=${answersKey}`
       console.log(`[search] answers api: ${url2.slice(0, 100)}`)
@@ -259,5 +246,5 @@ app.post('/search', async (req, res) => {
   }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v49' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v49 running on port ' + (process.env.PORT || 3000)))
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v50' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v50 running on port ' + (process.env.PORT || 3000)))
