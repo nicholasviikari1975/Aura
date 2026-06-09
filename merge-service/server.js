@@ -65,10 +65,10 @@ app.use((req, res, next) => {
 
 // ============================================================
 // POST /merge — Yhdistä klippit + audio
-// v50 (8.6.2026): NORMALISOIVA merge. Kaikki klipit skaalataan
-// samaan 1080x1920 30fps -formaattiin ennen concatia. Korjaa:
-// lipsync- ja intro/outro-klipit (eri formaatti) rikkoivat
-// vanhan stream-copyn. Tukee vaihtelevan maaran klippeja.
+// v51 (9.6.2026): NORMALISOIVA merge 720p (Render Hobby -tason kestama).
+// Kaikki klipit skaalataan samaan 720x1280 30fps -formaattiin ennen
+// concatia -> lipsync- ja intro/outro-klipit (eri formaatti) eivat
+// enaa riko mergea. preset veryfast + crf 26 = kevyt mutta siisti.
 // ============================================================
 app.post('/merge', async (req, res) => {
   const { job_id, clip_urls, audio_url } = req.body
@@ -94,15 +94,15 @@ app.post('/merge', async (req, res) => {
     await download(audio_url, `${tmp}/audio.mp3`)
     console.log(`[merge] audio ok`)
 
-    // NORMALISOIVA concat-filter: jokainen klippi skaalataan + padataan
-    // samaan 1080x1920 30fps yuv420p -formaattiin. Eri lahteet
+    // NORMALISOIVA concat-filter 720p. Jokainen klippi skaalataan +
+    // padataan samaan 720x1280 30fps yuv420p -formaattiin. Eri lahteet
     // (Seedance, pixverse-lipsync, intro/outro) yhdistyvat ongelmitta.
     const inputs = clip_urls.map((_, i) => `-i ${tmp}/clip${i}.mp4`).join(' ')
     const n = clip_urls.length
     let filter = ''
     for (let i = 0; i < n; i++) {
-      filter += `[${i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,` +
-                `pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,fps=30,setsar=1,format=yuv420p[v${i}];`
+      filter += `[${i}:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
+                `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=30,setsar=1,format=yuv420p[v${i}];`
     }
     for (let i = 0; i < n; i++) filter += `[v${i}]`
     filter += `concat=n=${n}:v=1:a=0[outv]`
@@ -111,13 +111,13 @@ app.post('/merge', async (req, res) => {
       `ffmpeg -y ${inputs} -i ${tmp}/audio.mp3 ` +
       `-filter_complex "${filter}" ` +
       `-map "[outv]" -map ${n}:a ` +
-      `-c:v libx264 -preset fast -crf 20 -pix_fmt yuv420p ` +
-      `-c:a aac -b:a 192k -shortest -movflags +faststart ${tmp}/final.mp4`,
-      { timeout: 300000, stdio: 'pipe' }
+      `-c:v libx264 -preset veryfast -crf 26 -pix_fmt yuv420p ` +
+      `-c:a aac -b:a 128k -shortest -movflags +faststart ${tmp}/final.mp4`,
+      { timeout: 280000, stdio: 'pipe' }
     )
 
     const sizeMB = (fs.statSync(`${tmp}/final.mp4`).size / 1024 / 1024).toFixed(1)
-    console.log(`[merge] final: ${sizeMB} MB (normalized 1080p)`)
+    console.log(`[merge] final: ${sizeMB} MB (normalized 720p)`)
 
     const url = await uploadVideoToSupabase(`${tmp}/final.mp4`, `merged/job_${job_id}_final.mp4`)
     await sb.from('video_jobs').update({ status: 'merged', merged_video_url: url, updated_at: new Date().toISOString() }).eq('id', job_id)
@@ -246,5 +246,5 @@ app.post('/search', async (req, res) => {
   }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v50' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v50 running on port ' + (process.env.PORT || 3000)))
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v51' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v51 running on port ' + (process.env.PORT || 3000)))
