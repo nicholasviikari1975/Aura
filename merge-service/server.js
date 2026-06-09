@@ -65,10 +65,13 @@ app.use((req, res, next) => {
 
 // ============================================================
 // POST /merge — Yhdistä klippit + audio
-// v51 (9.6.2026): NORMALISOIVA merge 720p (Render Hobby -tason kestama).
-// Kaikki klipit skaalataan samaan 720x1280 30fps -formaattiin ennen
-// concatia -> lipsync- ja intro/outro-klipit (eri formaatti) eivat
-// enaa riko mergea. preset veryfast + crf 26 = kevyt mutta siisti.
+// v52 (9.6.2026): RAM-YSTAVALLINEN normalisoiva merge.
+// Render Hobby = 512MB RAM. Vanha v51 filter_complex latasi kaikki
+// 7 klippia raakana muistiin -> OOM -> instanssi restartoi kesken.
+// KORJAUS: normalisoi jokainen klippi ERIKSEEN (1 klippi muistissa
+// kerrallaan) 720p:hen, sitten yhdista concat-demuxilla stream copy
+// (ei muistia syova). Lipsync/intro/outro eivat riko koska kaikki
+// normalisoitu samaan formaattiin ennen concatia.
 // ============================================================
 app.post('/merge', async (req, res) => {
   const { job_id, clip_urls, audio_url } = req.body
@@ -83,41 +86,46 @@ app.post('/merge', async (req, res) => {
   try {
     console.log(`[merge] START ${job_id} — ${clip_urls.length} clips`)
 
+    // 1. Lataa + normalisoi jokainen klippi ERIKSEEN (matala RAM)
     for (let i = 0; i < clip_urls.length; i++) {
-      const dest = `${tmp}/clip${i}.mp4`
-      await download(clip_urls[i], dest)
-      const size = fs.statSync(dest).size
-      if (size < 1000) throw new Error(`clip${i}.mp4 corrupted (${size} bytes)`)
-      console.log(`[merge] clip ${i+1}/${clip_urls.length} ok (${(size/1024/1024).toFixed(1)} MB)`)
+      const raw = `${tmp}/raw${i}.mp4`
+      await download(clip_urls[i], raw)
+      const size = fs.statSync(raw).size
+      if (size < 1000) throw new Error(`raw${i}.mp4 corrupted (${size} bytes)`)
+      console.log(`[merge] downloaded ${i+1}/${clip_urls.length} (${(size/1024/1024).toFixed(1)} MB)`)
+
+      // Normalisoi tama yksi klippi 720x1280 30fps. Yksi ffmpeg-prosessi,
+      // yksi klippi muistissa -> mahtuu 512MB:hen.
+      const norm = `${tmp}/norm${i}.mp4`
+      execSync(
+        `ffmpeg -y -i ${raw} ` +
+        `-vf "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=30,setsar=1,format=yuv420p" ` +
+        `-c:v libx264 -preset veryfast -crf 26 -an ${norm}`,
+        { timeout: 90000, stdio: 'pipe' }
+      )
+      fs.unlinkSync(raw) // vapauta levytila heti
+      console.log(`[merge] normalized ${i+1}/${clip_urls.length}`)
     }
 
     await download(audio_url, `${tmp}/audio.mp3`)
     console.log(`[merge] audio ok`)
 
-    // NORMALISOIVA concat-filter 720p. Jokainen klippi skaalataan +
-    // padataan samaan 720x1280 30fps yuv420p -formaattiin. Eri lahteet
-    // (Seedance, pixverse-lipsync, intro/outro) yhdistyvat ongelmitta.
-    const inputs = clip_urls.map((_, i) => `-i ${tmp}/clip${i}.mp4`).join(' ')
-    const n = clip_urls.length
-    let filter = ''
-    for (let i = 0; i < n; i++) {
-      filter += `[${i}:v]scale=720:1280:force_original_aspect_ratio=decrease,` +
-                `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=30,setsar=1,format=yuv420p[v${i}];`
-    }
-    for (let i = 0; i < n; i++) filter += `[v${i}]`
-    filter += `concat=n=${n}:v=1:a=0[outv]`
+    // 2. Concat-demux stream copy (kaikki jo samaa formaattia -> kevyt, ei OOM)
+    const lines = clip_urls.map((_, i) => `file '${tmp}/norm${i}.mp4'`)
+    fs.writeFileSync(`${tmp}/concat.txt`, lines.join('\n'))
 
     execSync(
-      `ffmpeg -y ${inputs} -i ${tmp}/audio.mp3 ` +
-      `-filter_complex "${filter}" ` +
-      `-map "[outv]" -map ${n}:a ` +
-      `-c:v libx264 -preset veryfast -crf 26 -pix_fmt yuv420p ` +
-      `-c:a aac -b:a 128k -shortest -movflags +faststart ${tmp}/final.mp4`,
-      { timeout: 280000, stdio: 'pipe' }
+      `ffmpeg -y -f concat -safe 0 -i ${tmp}/concat.txt -c:v copy -an ${tmp}/video_only.mp4`,
+      { timeout: 120000, stdio: 'pipe' }
+    )
+    // 3. Lisaa audio (stream copy video, encode audio)
+    execSync(
+      `ffmpeg -y -i ${tmp}/video_only.mp4 -i ${tmp}/audio.mp3 -c:v copy -c:a aac -b:a 128k -shortest -movflags +faststart ${tmp}/final.mp4`,
+      { timeout: 60000, stdio: 'pipe' }
     )
 
     const sizeMB = (fs.statSync(`${tmp}/final.mp4`).size / 1024 / 1024).toFixed(1)
-    console.log(`[merge] final: ${sizeMB} MB (normalized 720p)`)
+    console.log(`[merge] final: ${sizeMB} MB (normalized 720p, low-RAM)`)
 
     const url = await uploadVideoToSupabase(`${tmp}/final.mp4`, `merged/job_${job_id}_final.mp4`)
     await sb.from('video_jobs').update({ status: 'merged', merged_video_url: url, updated_at: new Date().toISOString() }).eq('id', job_id)
@@ -144,34 +152,25 @@ app.post('/split-audio', async (req, res) => {
 
   try {
     console.log(`[split] START ${script_id} — ${timings.length} segments`)
-
     await download(audio_url, `${tmp}/master.mp3`)
     console.log(`[split] master audio downloaded`)
-
     const segments = []
-
     for (const timing of timings) {
       const { shot, start, end } = timing
       const duration = end - start
       const dest = `${tmp}/shot${shot}.mp3`
-
       execSync(
         `ffmpeg -y -i ${tmp}/master.mp3 -ss ${start} -t ${duration} -c:a copy ${dest}`,
         { timeout: 30000, stdio: 'pipe' }
       )
-
       const size = fs.statSync(dest).size
       console.log(`[split] shot ${shot} ok (${(size/1024).toFixed(0)} KB, ${start}-${end}s)`)
-
       const storagePath = `segments/${script_id}_shot${shot}.mp3`
       const url = await uploadToSupabase(dest, storagePath)
-
       segments.push({ shot, start, end, url, size })
     }
-
     console.log(`[split] DONE — ${segments.length} segments`)
     res.json({ ok: true, script_id, segments })
-
   } catch (err) {
     console.error(`[split] ERROR: ${err.message}`)
     res.status(500).json({ ok: false, error: err.message })
@@ -186,65 +185,40 @@ app.post('/split-audio', async (req, res) => {
 app.post('/search', async (req, res) => {
   const { query, count = 4 } = req.body
   if (!query) return res.status(400).json({ ok: false, error: 'query vaaditaan' })
-
   const searchKey = process.env.BRAVE_SEARCH_API_KEY
   const answersKey = process.env.BRAVE_ANSWERS_API_KEY
-
   if (!searchKey && !answersKey) return res.status(500).json({ ok: false, error: 'Brave API keys puuttuvat' })
-
   try {
     console.log(`[search] query: ${query}`)
-
     if (searchKey) {
       const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}&search_lang=en`
-      console.log(`[search] web search: ${url.slice(0, 100)}`)
-      const response = await fetch(url, {
-        headers: {
-          'Accept': 'application/json',
-          'Accept-Encoding': 'gzip',
-          'X-Subscription-Token': searchKey
-        }
-      })
+      const response = await fetch(url, { headers: { 'Accept': 'application/json', 'Accept-Encoding': 'gzip', 'X-Subscription-Token': searchKey } })
       console.log(`[search] web status: ${response.status}`)
       if (response.ok) {
         const data = await response.json()
         const results = data?.web?.results || []
         const facts = results.slice(0, count).map(r => r.description || r.extra_snippets?.[0] || '').filter(s => s.length > 20).join(' | ')
-        console.log(`[search] web ok — ${results.length} results, ${facts.length} chars`)
         if (facts.length > 0) return res.json({ ok: true, facts, results_count: results.length, source: 'web' })
-        console.log('[search] web returned empty facts, trying answers...')
       }
     }
-
     if (answersKey) {
       const url2 = `https://api.search.brave.com/res/v1/summarizer/search?q=${encodeURIComponent(query)}&count=${count}&key=${answersKey}`
-      console.log(`[search] answers api: ${url2.slice(0, 100)}`)
-      const res2 = await fetch(url2, {
-        headers: {
-          'Accept': 'application/json',
-          'Accept-Encoding': 'gzip',
-          'X-Subscription-Token': answersKey
-        }
-      })
+      const res2 = await fetch(url2, { headers: { 'Accept': 'application/json', 'Accept-Encoding': 'gzip', 'X-Subscription-Token': answersKey } })
       console.log(`[search] answers status: ${res2.status}`)
       if (res2.ok) {
         const data2 = await res2.json()
         const summary = (data2?.summary || []).map(s => s.text || '').filter(t => t.length > 10).join(' ')
         const snippets = (data2?.results || []).slice(0, count).map(r => r.description || '').filter(s => s.length > 20).join(' | ')
         const facts2 = [summary, snippets].filter(Boolean).join(' | ')
-        console.log(`[search] answers ok — ${facts2.length} chars`)
         return res.json({ ok: true, facts: facts2, results_count: data2?.results?.length || 0, source: 'answers' })
       }
     }
-
-    console.log('[search] both APIs failed or returned empty')
     res.json({ ok: true, facts: '', results_count: 0, source: 'none' })
-
   } catch (err) {
     console.error(`[search] exception: ${err.message}`)
     res.status(500).json({ ok: false, error: err.message })
   }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v51' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v51 running on port ' + (process.env.PORT || 3000)))
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v52' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v52 running on port ' + (process.env.PORT || 3000)))
