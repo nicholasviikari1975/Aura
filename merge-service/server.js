@@ -13,6 +13,11 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
 const MERGE_API_KEY = process.env.MERGE_API_KEY
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY)
 
+// Logo intro/outro asetukset
+const LOGO_URL = process.env.LOGO_URL || 'https://feavsiliwajtqxgpbmqu.supabase.co/storage/v1/object/public/aura-assets/Archive%20logo.jpg'
+const INTRO_DURATION = 1.5
+const OUTRO_DURATION = 1.5
+
 async function download(url, dest) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest)
@@ -64,14 +69,11 @@ app.use((req, res, next) => {
 })
 
 // ============================================================
-// POST /merge — Yhdistä klippit + audio
-// v52 (9.6.2026): RAM-YSTAVALLINEN normalisoiva merge.
-// Render Hobby = 512MB RAM. Vanha v51 filter_complex latasi kaikki
-// 7 klippia raakana muistiin -> OOM -> instanssi restartoi kesken.
-// KORJAUS: normalisoi jokainen klippi ERIKSEEN (1 klippi muistissa
-// kerrallaan) 720p:hen, sitten yhdista concat-demuxilla stream copy
-// (ei muistia syova). Lipsync/intro/outro eivat riko koska kaikki
-// normalisoitu samaan formaattiin ennen concatia.
+// POST /merge — Yhdistä klippit + audio + logo intro/outro
+// v53 (12.6.2026): v52 + logo-intro ja -outro (1.5s musta tausta + logo, fade).
+// Matala-RAM säilyy: intro/outro tehdään erillisinä normalisoituina klippeinä,
+// liitetään concat-demuxilla. Audio liitetään VAIN sisältöosaan (intro/outro hiljaisia),
+// joten lipsync-synkka säilyy. Logo JPG ok koska tausta musta.
 // ============================================================
 app.post('/merge', async (req, res) => {
   const { job_id, clip_urls, audio_url } = req.body
@@ -84,18 +86,15 @@ app.post('/merge', async (req, res) => {
   fs.mkdirSync(tmp, { recursive: true })
 
   try {
-    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips`)
+    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips + logo`)
 
-    // 1. Lataa + normalisoi jokainen klippi ERIKSEEN (matala RAM)
+    // 1. Lataa + normalisoi jokainen sisältöklippi ERIKSEEN (matala RAM)
     for (let i = 0; i < clip_urls.length; i++) {
       const raw = `${tmp}/raw${i}.mp4`
       await download(clip_urls[i], raw)
       const size = fs.statSync(raw).size
       if (size < 1000) throw new Error(`raw${i}.mp4 corrupted (${size} bytes)`)
       console.log(`[merge] downloaded ${i+1}/${clip_urls.length} (${(size/1024/1024).toFixed(1)} MB)`)
-
-      // Normalisoi tama yksi klippi 720x1280 30fps. Yksi ffmpeg-prosessi,
-      // yksi klippi muistissa -> mahtuu 512MB:hen.
       const norm = `${tmp}/norm${i}.mp4`
       execSync(
         `ffmpeg -y -i ${raw} ` +
@@ -103,31 +102,74 @@ app.post('/merge', async (req, res) => {
         `-c:v libx264 -preset veryfast -crf 26 -an ${norm}`,
         { timeout: 90000, stdio: 'pipe' }
       )
-      fs.unlinkSync(raw) // vapauta levytila heti
+      fs.unlinkSync(raw)
       console.log(`[merge] normalized ${i+1}/${clip_urls.length}`)
     }
 
     await download(audio_url, `${tmp}/audio.mp3`)
     console.log(`[merge] audio ok`)
 
-    // 2. Concat-demux stream copy (kaikki jo samaa formaattia -> kevyt, ei OOM)
-    const lines = clip_urls.map((_, i) => `file '${tmp}/norm${i}.mp4'`)
-    fs.writeFileSync(`${tmp}/concat.txt`, lines.join('\n'))
-
+    // 2. Concat sisältöklipit (ilman audiota), liitä audio -> content.mp4
+    const contentLines = clip_urls.map((_, i) => `file '${tmp}/norm${i}.mp4'`)
+    fs.writeFileSync(`${tmp}/concat_content.txt`, contentLines.join('\n'))
     execSync(
-      `ffmpeg -y -f concat -safe 0 -i ${tmp}/concat.txt -c:v copy -an ${tmp}/video_only.mp4`,
+      `ffmpeg -y -f concat -safe 0 -i ${tmp}/concat_content.txt -c:v copy -an ${tmp}/content_video.mp4`,
       { timeout: 120000, stdio: 'pipe' }
     )
-    // 3. Lisaa audio (stream copy video, encode audio)
+    // Audio VAIN sisältöön (intro/outro hiljaisia) -> lipsync-synkka säilyy
     execSync(
-      `ffmpeg -y -i ${tmp}/video_only.mp4 -i ${tmp}/audio.mp3 -c:v copy -c:a aac -b:a 128k -shortest -movflags +faststart ${tmp}/final.mp4`,
+      `ffmpeg -y -i ${tmp}/content_video.mp4 -i ${tmp}/audio.mp3 -c:v copy -c:a aac -b:a 128k -shortest ${tmp}/content.mp4`,
       { timeout: 60000, stdio: 'pipe' }
     )
+    console.log(`[merge] content with audio ok`)
 
-    const sizeMB = (fs.statSync(`${tmp}/final.mp4`).size / 1024 / 1024).toFixed(1)
-    console.log(`[merge] final: ${sizeMB} MB (normalized 720p, low-RAM)`)
+    // 3. Logo intro + outro: musta tausta + logo keskellä, fade in/out, hiljainen audioraita.
+    let logoOk = false
+    try {
+      await download(LOGO_URL, `${tmp}/logo.jpg`)
+      const logoSize = fs.statSync(`${tmp}/logo.jpg`).size
+      if (logoSize > 1000) {
+        // Intro: musta tausta, logo skaalattu mahtumaan (max 500px leveä), fade in+out, hiljainen stereo-audio
+        const buildLogoClip = (dest, dur) => {
+          execSync(
+            `ffmpeg -y -loop 1 -i ${tmp}/logo.jpg -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 ` +
+            `-filter_complex "[0:v]scale=500:-1:force_original_aspect_ratio=decrease,` +
+            `pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=30,setsar=1,format=yuv420p,` +
+            `fade=t=in:st=0:d=0.4,fade=t=out:st=${(dur-0.4).toFixed(2)}:d=0.4[v]" ` +
+            `-map "[v]" -map 1:a -t ${dur} -c:v libx264 -preset veryfast -crf 26 -c:a aac -b:a 128k -shortest ${dest}`,
+            { timeout: 60000, stdio: 'pipe' }
+          )
+        }
+        buildLogoClip(`${tmp}/intro.mp4`, INTRO_DURATION)
+        buildLogoClip(`${tmp}/outro.mp4`, OUTRO_DURATION)
+        logoOk = true
+        console.log(`[merge] logo intro/outro built`)
+      }
+    } catch (logoErr) {
+      console.error(`[merge] logo failed, jatketaan ilman: ${logoErr.message}`)
+    }
 
-    const url = await uploadVideoToSupabase(`${tmp}/final.mp4`, `merged/job_${job_id}_final.mp4`)
+    let finalSource
+    if (logoOk) {
+      // 4. Concat: intro + content + outro. Kaikki samaa formaattia + audioraita -> stream copy turvallinen.
+      // Mutta content on jo aac+h264; intro/outro samoin. Concat-demux vaatii saman koodekin -> ok.
+      fs.writeFileSync(`${tmp}/concat_final.txt`,
+        `file '${tmp}/intro.mp4'\nfile '${tmp}/content.mp4'\nfile '${tmp}/outro.mp4'`)
+      execSync(
+        `ffmpeg -y -f concat -safe 0 -i ${tmp}/concat_final.txt -c:v copy -c:a aac -b:a 128k -movflags +faststart ${tmp}/final.mp4`,
+        { timeout: 90000, stdio: 'pipe' }
+      )
+      finalSource = `${tmp}/final.mp4`
+    } else {
+      // Logo epäonnistui -> käytä pelkkää sisältöä (ei riko mergeä)
+      execSync(`ffmpeg -y -i ${tmp}/content.mp4 -c copy -movflags +faststart ${tmp}/final.mp4`, { timeout: 60000, stdio: 'pipe' })
+      finalSource = `${tmp}/final.mp4`
+    }
+
+    const sizeMB = (fs.statSync(finalSource).size / 1024 / 1024).toFixed(1)
+    console.log(`[merge] final: ${sizeMB} MB (logo: ${logoOk})`)
+
+    const url = await uploadVideoToSupabase(finalSource, `merged/job_${job_id}_final.mp4`)
     await sb.from('video_jobs').update({ status: 'merged', merged_video_url: url, updated_at: new Date().toISOString() }).eq('id', job_id)
     console.log(`[merge] DONE ${job_id}`)
 
@@ -140,7 +182,7 @@ app.post('/merge', async (req, res) => {
 })
 
 // ============================================================
-// POST /split-audio — Pilko audio per shot-segmentti
+// POST /split-audio — Pilko audio per shot-segmentti (ENNALLAAN v52:sta)
 // ============================================================
 app.post('/split-audio', async (req, res) => {
   const { script_id, audio_url, timings } = req.body
@@ -180,7 +222,7 @@ app.post('/split-audio', async (req, res) => {
 })
 
 // ============================================================
-// POST /search — Brave Search proxy
+// POST /search — Brave Search proxy (ENNALLAAN v52:sta)
 // ============================================================
 app.post('/search', async (req, res) => {
   const { query, count = 4 } = req.body
@@ -220,5 +262,5 @@ app.post('/search', async (req, res) => {
   }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v52' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v52 running on port ' + (process.env.PORT || 3000)))
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v53' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v53 running on port ' + (process.env.PORT || 3000)))
