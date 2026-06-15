@@ -14,8 +14,11 @@ const MERGE_API_KEY = process.env.MERGE_API_KEY
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY)
 
 const LOGO_URL = process.env.LOGO_URL || 'https://feavsiliwajtqxgpbmqu.supabase.co/storage/v1/object/public/aura-assets/Archive%20logo.jpg'
-const INTRO_DURATION = 1.5
-const OUTRO_DURATION = 1.5
+// v56: oletukset; config voi yliajaa (logo_scale_px, logo_intro_duration) ilman deployta
+const DEFAULT_LOGO_SCALE = 600
+const DEFAULT_INTRO_DURATION = 1.5
+const DEFAULT_OUTRO_DURATION = 1.5
+const DEFAULT_LOGO_COLORKEY = 0.15
 
 async function download(url, dest) {
   return new Promise((resolve, reject) => {
@@ -69,9 +72,9 @@ app.use((req, res, next) => {
 
 // ============================================================
 // POST /merge — klippit + audio + logo intro/outro
-// v54 (12.6): KORJATTU logo-vaihe. v53 kaatoi Renderin (18MB JPG + loop + filter_complex
-// roikkui/OOM). v54: kutista logo KERRAN pieneksi PNG:ksi ensin, sitten kevyet komennot,
-// kovat -t rajat. Logo-failsafe säilyy. Matala-RAM säilyy.
+// v56 (15.6): logon koko configista (logo_scale_px, oletus 600 vrt v54 440).
+// Lisäksi logo_intro_duration configista. Muu logiikka v54:stä 1:1 (matala-RAM,
+// vaiheittainen kutistus, failsafe). v55 tekstityspatch EI sisälly tähän (erillinen).
 // ============================================================
 app.post('/merge', async (req, res) => {
   const { job_id, clip_urls, audio_url } = req.body
@@ -80,11 +83,24 @@ app.post('/merge', async (req, res) => {
 
   res.status(202).json({ ok: true, job_id, clips: clip_urls.length, status: 'processing' })
 
+  // v56: lue logo-asetukset configista (failsafe oletuksiin)
+  let logoScale = DEFAULT_LOGO_SCALE
+  let introDur = DEFAULT_INTRO_DURATION
+  let outroDur = DEFAULT_OUTRO_DURATION
+  let logoKey = DEFAULT_LOGO_COLORKEY
+  try {
+    const { data: cfg } = await sb.from('config').select('logo_scale_px, logo_intro_duration, logo_colorkey_similarity').eq('id', 1).maybeSingle()
+    if (cfg?.logo_scale_px && Number(cfg.logo_scale_px) > 0) logoScale = Math.min(720, Math.max(100, Number(cfg.logo_scale_px)))
+    if (cfg?.logo_intro_duration && Number(cfg.logo_intro_duration) > 0) { introDur = Number(cfg.logo_intro_duration); outroDur = Number(cfg.logo_intro_duration) }
+    if (cfg?.logo_colorkey_similarity != null && Number(cfg.logo_colorkey_similarity) >= 0) logoKey = Math.min(0.5, Math.max(0, Number(cfg.logo_colorkey_similarity)))
+  } catch (e) { console.error('[merge] config-luku epäonnistui, oletukset:', e.message) }
+  console.log(`[merge] logo_scale=${logoScale}px intro=${introDur}s colorkey=${logoKey}`)
+
   const tmp = `/tmp/job_${job_id}`
   fs.mkdirSync(tmp, { recursive: true })
 
   try {
-    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips + logo (v54)`)
+    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips + logo (v56)`)
 
     // 1. Lataa + normalisoi sisältöklipit erikseen (matala RAM)
     for (let i = 0; i < clip_urls.length; i++) {
@@ -117,12 +133,18 @@ app.post('/merge', async (req, res) => {
     try {
       await download(LOGO_URL, `${tmp}/logo_raw.jpg`)
       if (fs.statSync(`${tmp}/logo_raw.jpg`).size > 1000) {
-        // 3a. Kutista logo KERRAN pieneksi pre-skaalattuna kuvana (18MB -> ~kt). Tämä on kevyt yksittäisoperaatio.
-        execSync(`ffmpeg -y -i ${tmp}/logo_raw.jpg -vf "scale=440:-1" -frames:v 1 ${tmp}/logo_small.png`, { timeout: 30000, stdio: 'pipe' })
+        // 3a. v56: kutista logo configin leveyteen (oletus 600). Pariton -> -2 pakottaa parilliseksi.
+        // Sama vaihe poistaa mustan taustan colorkeyllä (logo: musta tausta + kultainen teksti).
+        // colorkey=0x000000 similarity 0.15 -> tummat alueet läpinäkyviksi, kulta jää. PNG säilyttää alfan.
+        execSync(`ffmpeg -y -i ${tmp}/logo_raw.jpg -vf "scale=${logoScale}:-2,format=rgba,colorkey=0x000000:${logoKey}:0.05" -frames:v 1 ${tmp}/logo_small.png`, { timeout: 30000, stdio: 'pipe' })
         fs.unlinkSync(`${tmp}/logo_raw.jpg`)
-        // 3b. Tee logokortti (720x1280 musta + pieni logo keskellä), still PNG. Yksi kevyt operaatio.
-        execSync(`ffmpeg -y -i ${tmp}/logo_small.png -vf "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black" -frames:v 1 ${tmp}/logo_card.png`, { timeout: 30000, stdio: 'pipe' })
-        // 3c. Intro/outro videoklipit logokortista. Pieni PNG -> kevyt loop. Hiljainen audio. Fade.
+        // 3b. Logo (nyt läpinäkyvä tausta) keskelle mustaa 720x1280 korttia. overlay säilyttää alfan -> ei laatikkoa.
+        execSync(
+          `ffmpeg -y -f lavfi -i color=c=black:s=720x1280 -i ${tmp}/logo_small.png ` +
+          `-filter_complex "[0][1]overlay=(W-w)/2:(H-h)/2" -frames:v 1 ${tmp}/logo_card.png`,
+          { timeout: 30000, stdio: 'pipe' }
+        )
+        // 3c. Intro/outro videoklipit logokortista. Hiljainen audio. Fade.
         const buildLogoClip = (dest, dur) => {
           execSync(
             `ffmpeg -y -loop 1 -t ${dur} -i ${tmp}/logo_card.png -f lavfi -t ${dur} -i anullsrc=channel_layout=stereo:sample_rate=44100 ` +
@@ -131,10 +153,10 @@ app.post('/merge', async (req, res) => {
             { timeout: 45000, stdio: 'pipe' }
           )
         }
-        buildLogoClip(`${tmp}/intro.mp4`, INTRO_DURATION)
-        buildLogoClip(`${tmp}/outro.mp4`, OUTRO_DURATION)
+        buildLogoClip(`${tmp}/intro.mp4`, introDur)
+        buildLogoClip(`${tmp}/outro.mp4`, outroDur)
         logoOk = true
-        console.log(`[merge] logo intro/outro ok`)
+        console.log(`[merge] logo intro/outro ok (scale ${logoScale})`)
       }
     } catch (logoErr) {
       console.error(`[merge] logo failed, jatketaan ilman: ${logoErr.message}`)
@@ -225,5 +247,5 @@ app.post('/search', async (req, res) => {
   }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v54' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v54 running on port ' + (process.env.PORT || 3000)))
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v56' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v56 running on port ' + (process.env.PORT || 3000)))
