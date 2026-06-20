@@ -19,6 +19,8 @@ const DEFAULT_LOGO_SCALE = 600
 const DEFAULT_INTRO_DURATION = 1.5
 const DEFAULT_OUTRO_DURATION = 1.5
 const DEFAULT_LOGO_COLORKEY = 0.15
+// v57: pullo-introframen oletuskesto (config: bottle_intro_duration voi yliajaa)
+const DEFAULT_BOTTLE_INTRO_DURATION = 1.5
 
 async function download(url, dest) {
   return new Promise((resolve, reject) => {
@@ -71,36 +73,45 @@ app.use((req, res, next) => {
 })
 
 // ============================================================
-// POST /merge — klippit + audio + logo intro/outro
-// v56 (15.6): logon koko configista (logo_scale_px, oletus 600 vrt v54 440).
-// Lisäksi logo_intro_duration configista. Muu logiikka v54:stä 1:1 (matala-RAM,
-// vaiheittainen kutistus, failsafe). v55 tekstityspatch EI sisälly tähän (erillinen).
+// POST /merge — klippit + audio + logo intro/outro + PULLO-INTROFRAME (v57)
+// v57 (19.6): intro_image_url (pullokuva) -> 1.5s klippi sisällön ALKUUN, heti
+//   logo-intron jälkeen. Tällöin videon näkyvä kansi on pullo (IG/TikTok ottavat
+//   kannen framesta, YT myös ilman custom-thumbnailia). Failsafe: jos pullokuva
+//   puuttuu/kaatuu, jatketaan ilman (kuten logo).
+//   Järjestys: [logo intro] -> [PULLO intro] -> [sisältö+audio] -> [logo outro].
+//   Audio alkaa vasta sisällöstä (logon ja pullon päällä hiljaisuus), kuten ennen.
+// v56: logon koko configista (logo_scale_px). Muu logiikka v54:stä (matala-RAM,
+//   vaiheittainen kutistus, failsafe).
 // ============================================================
 app.post('/merge', async (req, res) => {
-  const { job_id, clip_urls, audio_url } = req.body
+  const { job_id, clip_urls, audio_url, intro_image_url, intro_duration } = req.body
   if (!job_id || !clip_urls?.length || !audio_url)
     return res.status(400).json({ ok: false, error: 'Parametrit puuttuu' })
 
-  res.status(202).json({ ok: true, job_id, clips: clip_urls.length, status: 'processing' })
+  res.status(202).json({ ok: true, job_id, clips: clip_urls.length, status: 'processing', bottle_intro: !!intro_image_url })
 
   // v56: lue logo-asetukset configista (failsafe oletuksiin)
   let logoScale = DEFAULT_LOGO_SCALE
   let introDur = DEFAULT_INTRO_DURATION
   let outroDur = DEFAULT_OUTRO_DURATION
   let logoKey = DEFAULT_LOGO_COLORKEY
+  let bottleIntroDur = DEFAULT_BOTTLE_INTRO_DURATION
   try {
-    const { data: cfg } = await sb.from('config').select('logo_scale_px, logo_intro_duration, logo_colorkey_similarity').eq('id', 1).maybeSingle()
+    const { data: cfg } = await sb.from('config').select('logo_scale_px, logo_intro_duration, logo_colorkey_similarity, bottle_intro_duration').eq('id', 1).maybeSingle()
     if (cfg?.logo_scale_px && Number(cfg.logo_scale_px) > 0) logoScale = Math.min(720, Math.max(100, Number(cfg.logo_scale_px)))
     if (cfg?.logo_intro_duration && Number(cfg.logo_intro_duration) > 0) { introDur = Number(cfg.logo_intro_duration); outroDur = Number(cfg.logo_intro_duration) }
     if (cfg?.logo_colorkey_similarity != null && Number(cfg.logo_colorkey_similarity) >= 0) logoKey = Math.min(0.5, Math.max(0, Number(cfg.logo_colorkey_similarity)))
+    if (cfg?.bottle_intro_duration && Number(cfg.bottle_intro_duration) > 0) bottleIntroDur = Math.min(4, Math.max(0.5, Number(cfg.bottle_intro_duration)))
   } catch (e) { console.error('[merge] config-luku epäonnistui, oletukset:', e.message) }
-  console.log(`[merge] logo_scale=${logoScale}px intro=${introDur}s colorkey=${logoKey}`)
+  // Payloadin intro_duration (merge-video lähettää) ylittää configin, jos annettu validina.
+  if (intro_duration && Number(intro_duration) > 0) bottleIntroDur = Math.min(4, Math.max(0.5, Number(intro_duration)))
+  console.log(`[merge] logo_scale=${logoScale}px intro=${introDur}s colorkey=${logoKey} bottle_intro=${bottleIntroDur}s`)
 
   const tmp = `/tmp/job_${job_id}`
   fs.mkdirSync(tmp, { recursive: true })
 
   try {
-    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips + logo (v56)`)
+    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips + logo${intro_image_url ? ' + bottle-intro' : ''} (v57)`)
 
     // 1. Lataa + normalisoi sisältöklipit erikseen (matala RAM)
     for (let i = 0; i < clip_urls.length; i++) {
@@ -127,6 +138,38 @@ app.post('/merge', async (req, res) => {
     execSync(`ffmpeg -y -f concat -safe 0 -i ${tmp}/concat_content.txt -c:v copy -an ${tmp}/content_video.mp4`, { timeout: 120000, stdio: 'pipe' })
     execSync(`ffmpeg -y -i ${tmp}/content_video.mp4 -i ${tmp}/audio.mp3 -c:v copy -c:a aac -b:a 128k -shortest ${tmp}/content.mp4`, { timeout: 60000, stdio: 'pipe' })
     console.log(`[merge] content ready`)
+
+    // 2.5 PULLO-INTROFRAME (v57) — pullokuvasta lyhyt klippi sisällön alkuun.
+    // Kuva skaalataan 9:16-korttiin (sama 720x1280 kuin sisältö) mustalla paddingilla.
+    // Hiljainen audioraita + pehmeät fade-reunat. Failsafe: kaatuminen ei riko mergeä.
+    let bottleOk = false
+    if (intro_image_url) {
+      try {
+        await download(intro_image_url, `${tmp}/bottle_raw`)
+        if (fs.statSync(`${tmp}/bottle_raw`).size > 1000) {
+          // 2.5a Skaalaa pullo 9:16-korttiin (decrease + pad), PNG välitiedostoksi
+          execSync(
+            `ffmpeg -y -i ${tmp}/bottle_raw ` +
+            `-vf "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p" ` +
+            `-frames:v 1 ${tmp}/bottle_card.png`,
+            { timeout: 30000, stdio: 'pipe' }
+          )
+          fs.unlinkSync(`${tmp}/bottle_raw`)
+          // 2.5b Tee siitä bottleIntroDur-pituinen klippi, hiljainen ääni, fade in/out
+          execSync(
+            `ffmpeg -y -loop 1 -t ${bottleIntroDur} -i ${tmp}/bottle_card.png ` +
+            `-f lavfi -t ${bottleIntroDur} -i anullsrc=channel_layout=stereo:sample_rate=44100 ` +
+            `-vf "fps=30,format=yuv420p,fade=t=in:st=0:d=0.3,fade=t=out:st=${(bottleIntroDur-0.3).toFixed(2)}:d=0.3" ` +
+            `-c:v libx264 -preset veryfast -crf 26 -c:a aac -b:a 128k -t ${bottleIntroDur} ${tmp}/bottle_intro.mp4`,
+            { timeout: 45000, stdio: 'pipe' }
+          )
+          bottleOk = true
+          console.log(`[merge] bottle-intro ok (${bottleIntroDur}s)`)
+        }
+      } catch (bottleErr) {
+        console.error(`[merge] bottle-intro failed, jatketaan ilman: ${bottleErr.message}`)
+      }
+    }
 
     // 3. LOGO — kevyt, vaiheittain. Kaatuminen ei riko mergeä (failsafe).
     let logoOk = false
@@ -163,16 +206,24 @@ app.post('/merge', async (req, res) => {
     }
 
     // 4. Lopullinen concat
+    // Järjestys: [logo intro] -> [PULLO intro] -> [sisältö] -> [logo outro].
+    // Kaikki osat ovat valinnaisia (failsafe): jos jokin puuttuu, se jätetään pois.
     let finalSource = `${tmp}/final.mp4`
-    if (logoOk) {
-      fs.writeFileSync(`${tmp}/concat_final.txt`, `file '${tmp}/intro.mp4'\nfile '${tmp}/content.mp4'\nfile '${tmp}/outro.mp4'`)
+    const finalParts = []
+    if (logoOk) finalParts.push(`${tmp}/intro.mp4`)
+    if (bottleOk) finalParts.push(`${tmp}/bottle_intro.mp4`)
+    finalParts.push(`${tmp}/content.mp4`)
+    if (logoOk) finalParts.push(`${tmp}/outro.mp4`)
+
+    if (finalParts.length > 1) {
+      fs.writeFileSync(`${tmp}/concat_final.txt`, finalParts.map(p => `file '${p}'`).join('\n'))
       execSync(`ffmpeg -y -f concat -safe 0 -i ${tmp}/concat_final.txt -c:v copy -c:a aac -b:a 128k -movflags +faststart ${finalSource}`, { timeout: 90000, stdio: 'pipe' })
     } else {
       execSync(`ffmpeg -y -i ${tmp}/content.mp4 -c copy -movflags +faststart ${finalSource}`, { timeout: 60000, stdio: 'pipe' })
     }
 
     const sizeMB = (fs.statSync(finalSource).size / 1024 / 1024).toFixed(1)
-    console.log(`[merge] final: ${sizeMB} MB (logo: ${logoOk})`)
+    console.log(`[merge] final: ${sizeMB} MB (logo: ${logoOk}, bottle: ${bottleOk})`)
 
     const url = await uploadVideoToSupabase(finalSource, `merged/job_${job_id}_final.mp4`)
     await sb.from('video_jobs').update({ status: 'merged', merged_video_url: url, updated_at: new Date().toISOString() }).eq('id', job_id)
@@ -247,5 +298,5 @@ app.post('/search', async (req, res) => {
   }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v56' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v56 running on port ' + (process.env.PORT || 3000)))
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v57' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v57 running on port ' + (process.env.PORT || 3000)))
