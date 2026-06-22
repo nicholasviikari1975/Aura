@@ -73,7 +73,7 @@ app.use((req, res, next) => {
 })
 
 // ============================================================
-// POST /merge — klippit + audio + logo intro/outro + PULLO-INTROFRAME (v60)
+// POST /merge — klippit + audio + logo intro/outro + PULLO-INTROFRAME (v61)
 // v57 (19.6): intro_image_url (pullokuva) -> 1.5s klippi sisällön ALKUUN, heti
 //   logo-intron jälkeen. Tällöin videon näkyvä kansi on pullo (IG/TikTok ottavat
 //   kannen framesta, YT myös ilman custom-thumbnailia). Failsafe: jos pullokuva
@@ -84,7 +84,7 @@ app.use((req, res, next) => {
 //   vaiheittainen kutistus, failsafe).
 // ============================================================
 app.post('/merge', async (req, res) => {
-  const { job_id, clip_urls, audio_url, intro_image_url, intro_duration, intro_audio_url } = req.body
+  const { job_id, clip_urls, audio_url, intro_image_url, intro_duration, intro_audio_url, shot_duration } = req.body
   if (!job_id || !clip_urls?.length || !audio_url)
     return res.status(400).json({ ok: false, error: 'Parametrit puuttuu' })
 
@@ -111,7 +111,7 @@ app.post('/merge', async (req, res) => {
   fs.mkdirSync(tmp, { recursive: true })
 
   try {
-    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips + logo${intro_image_url ? ' + bottle-intro' : ''} (v60)`)
+    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips + logo${intro_image_url ? ' + bottle-intro' : ''} (v61)`)
 
     // 1. Lataa + normalisoi sisältöklipit erikseen (matala RAM)
     for (let i = 0; i < clip_urls.length; i++) {
@@ -120,15 +120,19 @@ app.post('/merge', async (req, res) => {
       const size = fs.statSync(raw).size
       if (size < 1000) throw new Error(`raw${i}.mp4 corrupted (${size} bytes)`)
       const norm = `${tmp}/norm${i}.mp4`
-      // v60: KIINTEA GOP + tasainen fps. Juurisyy nykaykseen saumassa: eri lahteista
-      // tulevat klipit (lipsync=pixverse, i2v/t2v=seedance) saivat eri keyframe-rakenteen,
-      // ja concat -c:v copy ei voinut tasata sita -> visuaalinen hyppy saumassa (erityisesti
-      // t2v-nuottikuvan ja i2v-avatarin valilla). -g 30 -keyint_min 30 -sc_threshold 0 pakottaa
-      // joka klipille IDENTTISEN GOPin (keyframe joka 30 frame = 1s), -r 30 tasaa fps:n.
+      // v61: JUURISYY lopun hyppyyn. Lip-synced shot1 (pixverse _output.mp4) tulee usein
+      // eri pituisena kuin 5s (pixverse saataa keston audio-segmentin mukaan), kun seedance-
+      // klipit ovat tasan 5s. Merge ei aiemmin pakottanut kestoa -> shot1:n pituusero siirsi
+      // KAIKKI seuraavat saumat epatahtiin -> kuva "hyppaa eteenpain" loppupuolen saumassa.
+      // Korjaus: pakota JOKAINEN klippi tasan shotDur:iin. tpad=stop_mode=clone padaa
+      // viimeisella framella jos klippi on lyhyt; -t leikkaa jos pitka. Nyt jokainen sauma
+      // osuu kohdalleen riippumatta siita mita pixverse/seedance tuotti.
+      // v60: KIINTEA GOP + tasainen fps (eri lahteiden keyframe-rakenteet yhtenaistetaan).
+      const shotDur = (Number(shot_duration) > 0 ? Number(shot_duration) : 5)
       execSync(
         `ffmpeg -y -i ${raw} ` +
-        `-vf "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=30,setsar=1,format=yuv420p" ` +
-        `-r 30 -g 30 -keyint_min 30 -sc_threshold 0 ` +
+        `-vf "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=30,setsar=1,format=yuv420p,tpad=stop_mode=clone:stop_duration=${shotDur}" ` +
+        `-t ${shotDur} -r 30 -g 30 -keyint_min 30 -sc_threshold 0 ` +
         `-c:v libx264 -preset veryfast -crf 26 -an ${norm}`,
         { timeout: 90000, stdio: 'pipe' }
       )
@@ -153,7 +157,7 @@ app.post('/merge', async (req, res) => {
     execSync(`ffmpeg -y -i ${tmp}/content_video.mp4 -i ${tmp}/audio.mp3 -af "apad" -c:v copy -c:a aac -b:a 128k -shortest ${tmp}/content.mp4`, { timeout: 60000, stdio: 'pipe' })
     console.log(`[merge] content ready`)
 
-    // 2.5 PULLO-INTROFRAME (v60) — pullokuvasta lyhyt klippi sisällön alkuun.
+    // 2.5 PULLO-INTROFRAME (v61) — pullokuvasta lyhyt klippi sisällön alkuun.
     // Kuva skaalataan 9:16-korttiin (sama 720x1280 kuin sisältö) mustalla paddingilla.
     // Hiljainen audioraita + pehmeät fade-reunat. Failsafe: kaatuminen ei riko mergeä.
     let bottleOk = false
@@ -338,5 +342,5 @@ app.post('/search', async (req, res) => {
   }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v60' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v60 running on port ' + (process.env.PORT || 3000)))
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v61' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v61 running on port ' + (process.env.PORT || 3000)))
