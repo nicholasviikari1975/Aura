@@ -73,7 +73,7 @@ app.use((req, res, next) => {
 })
 
 // ============================================================
-// POST /merge — klippit + audio + logo intro/outro + PULLO-INTROFRAME (v59)
+// POST /merge — klippit + audio + logo intro/outro + PULLO-INTROFRAME (v60)
 // v57 (19.6): intro_image_url (pullokuva) -> 1.5s klippi sisällön ALKUUN, heti
 //   logo-intron jälkeen. Tällöin videon näkyvä kansi on pullo (IG/TikTok ottavat
 //   kannen framesta, YT myös ilman custom-thumbnailia). Failsafe: jos pullokuva
@@ -111,7 +111,7 @@ app.post('/merge', async (req, res) => {
   fs.mkdirSync(tmp, { recursive: true })
 
   try {
-    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips + logo${intro_image_url ? ' + bottle-intro' : ''} (v59)`)
+    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips + logo${intro_image_url ? ' + bottle-intro' : ''} (v60)`)
 
     // 1. Lataa + normalisoi sisältöklipit erikseen (matala RAM)
     for (let i = 0; i < clip_urls.length; i++) {
@@ -120,9 +120,15 @@ app.post('/merge', async (req, res) => {
       const size = fs.statSync(raw).size
       if (size < 1000) throw new Error(`raw${i}.mp4 corrupted (${size} bytes)`)
       const norm = `${tmp}/norm${i}.mp4`
+      // v60: KIINTEA GOP + tasainen fps. Juurisyy nykaykseen saumassa: eri lahteista
+      // tulevat klipit (lipsync=pixverse, i2v/t2v=seedance) saivat eri keyframe-rakenteen,
+      // ja concat -c:v copy ei voinut tasata sita -> visuaalinen hyppy saumassa (erityisesti
+      // t2v-nuottikuvan ja i2v-avatarin valilla). -g 30 -keyint_min 30 -sc_threshold 0 pakottaa
+      // joka klipille IDENTTISEN GOPin (keyframe joka 30 frame = 1s), -r 30 tasaa fps:n.
       execSync(
         `ffmpeg -y -i ${raw} ` +
         `-vf "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=30,setsar=1,format=yuv420p" ` +
+        `-r 30 -g 30 -keyint_min 30 -sc_threshold 0 ` +
         `-c:v libx264 -preset veryfast -crf 26 -an ${norm}`,
         { timeout: 90000, stdio: 'pipe' }
       )
@@ -135,7 +141,11 @@ app.post('/merge', async (req, res) => {
     // 2. Sisältö-concat + audio
     const contentLines = clip_urls.map((_, i) => `file '${tmp}/norm${i}.mp4'`)
     fs.writeFileSync(`${tmp}/concat_content.txt`, contentLines.join('\n'))
-    execSync(`ffmpeg -y -f concat -safe 0 -i ${tmp}/concat_content.txt -c:v copy -an ${tmp}/content_video.mp4`, { timeout: 120000, stdio: 'pipe' })
+    // v60: concat RE-ENKOODAA (ei -c:v copy). Vaikka klipit on jo GOP-normalisoitu,
+    // re-enkoodaus concatin yhteydessa takaa etta saumakohdat ovat taysin sileita
+    // (uusi yhtenainen keyframe-virta koko sisallolle). Hieman hitaampi mutta poistaa
+    // saumahypyt lopullisesti. Klipit ovat jo samaa kokoa/fps -> nopea.
+    execSync(`ffmpeg -y -f concat -safe 0 -i ${tmp}/concat_content.txt -r 30 -g 30 -keyint_min 30 -sc_threshold 0 -c:v libx264 -preset veryfast -crf 26 -an ${tmp}/content_video.mp4`, { timeout: 120000, stdio: 'pipe' })
     // v59 (D): pad audio VIDEON pituuteen (apad) + -shortest. Nain video pysyy taysipitkana
     // (kaikki shotit soivat loppuun, viimeinen liike ei katkea) ja audio saa hiljaisen
     // hannan jos se on lyhyempi. -shortest leikkaa apad-hannan videon pituuteen.
@@ -143,7 +153,7 @@ app.post('/merge', async (req, res) => {
     execSync(`ffmpeg -y -i ${tmp}/content_video.mp4 -i ${tmp}/audio.mp3 -af "apad" -c:v copy -c:a aac -b:a 128k -shortest ${tmp}/content.mp4`, { timeout: 60000, stdio: 'pipe' })
     console.log(`[merge] content ready`)
 
-    // 2.5 PULLO-INTROFRAME (v59) — pullokuvasta lyhyt klippi sisällön alkuun.
+    // 2.5 PULLO-INTROFRAME (v60) — pullokuvasta lyhyt klippi sisällön alkuun.
     // Kuva skaalataan 9:16-korttiin (sama 720x1280 kuin sisältö) mustalla paddingilla.
     // Hiljainen audioraita + pehmeät fade-reunat. Failsafe: kaatuminen ei riko mergeä.
     let bottleOk = false
@@ -328,5 +338,5 @@ app.post('/search', async (req, res) => {
   }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v59' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v59 running on port ' + (process.env.PORT || 3000)))
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v60' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v60 running on port ' + (process.env.PORT || 3000)))
