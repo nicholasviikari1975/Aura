@@ -73,7 +73,7 @@ app.use((req, res, next) => {
 })
 
 // ============================================================
-// POST /merge — klippit + audio + logo intro/outro + PULLO-INTROFRAME (v58)
+// POST /merge — klippit + audio + logo intro/outro + PULLO-INTROFRAME (v59)
 // v57 (19.6): intro_image_url (pullokuva) -> 1.5s klippi sisällön ALKUUN, heti
 //   logo-intron jälkeen. Tällöin videon näkyvä kansi on pullo (IG/TikTok ottavat
 //   kannen framesta, YT myös ilman custom-thumbnailia). Failsafe: jos pullokuva
@@ -111,7 +111,7 @@ app.post('/merge', async (req, res) => {
   fs.mkdirSync(tmp, { recursive: true })
 
   try {
-    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips + logo${intro_image_url ? ' + bottle-intro' : ''} (v58)`)
+    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips + logo${intro_image_url ? ' + bottle-intro' : ''} (v59)`)
 
     // 1. Lataa + normalisoi sisältöklipit erikseen (matala RAM)
     for (let i = 0; i < clip_urls.length; i++) {
@@ -136,10 +136,14 @@ app.post('/merge', async (req, res) => {
     const contentLines = clip_urls.map((_, i) => `file '${tmp}/norm${i}.mp4'`)
     fs.writeFileSync(`${tmp}/concat_content.txt`, contentLines.join('\n'))
     execSync(`ffmpeg -y -f concat -safe 0 -i ${tmp}/concat_content.txt -c:v copy -an ${tmp}/content_video.mp4`, { timeout: 120000, stdio: 'pipe' })
-    execSync(`ffmpeg -y -i ${tmp}/content_video.mp4 -i ${tmp}/audio.mp3 -c:v copy -c:a aac -b:a 128k -shortest ${tmp}/content.mp4`, { timeout: 60000, stdio: 'pipe' })
+    // v59 (D): pad audio VIDEON pituuteen (apad) + -shortest. Nain video pysyy taysipitkana
+    // (kaikki shotit soivat loppuun, viimeinen liike ei katkea) ja audio saa hiljaisen
+    // hannan jos se on lyhyempi. -shortest leikkaa apad-hannan videon pituuteen.
+    // Aiemmin (v58) pelkka -shortest katkaisi VIDEON audion loppuessa -> nykays lopussa.
+    execSync(`ffmpeg -y -i ${tmp}/content_video.mp4 -i ${tmp}/audio.mp3 -af "apad" -c:v copy -c:a aac -b:a 128k -shortest ${tmp}/content.mp4`, { timeout: 60000, stdio: 'pipe' })
     console.log(`[merge] content ready`)
 
-    // 2.5 PULLO-INTROFRAME (v58) — pullokuvasta lyhyt klippi sisällön alkuun.
+    // 2.5 PULLO-INTROFRAME (v59) — pullokuvasta lyhyt klippi sisällön alkuun.
     // Kuva skaalataan 9:16-korttiin (sama 720x1280 kuin sisältö) mustalla paddingilla.
     // Hiljainen audioraita + pehmeät fade-reunat. Failsafe: kaatuminen ei riko mergeä.
     let bottleOk = false
@@ -324,5 +328,5 @@ app.post('/search', async (req, res) => {
   }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v58' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v58 running on port ' + (process.env.PORT || 3000)))
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v59' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v59 running on port ' + (process.env.PORT || 3000)))
