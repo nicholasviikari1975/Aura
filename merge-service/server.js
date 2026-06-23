@@ -73,7 +73,14 @@ app.use((req, res, next) => {
 })
 
 // ============================================================
-// POST /merge — klippit + audio + logo intro/outro + PULLO-INTROFRAME (v63)
+// POST /merge — klippit + audio + logo intro/outro + PULLO-INTROFRAME (v64)
+// v64 (23.6): PUHE EI ENAA LEIKKAUDU LOPUSTA. v63 laski lopullisen keston pelkasta
+//   videosta (contentDur = video) ja PAKOTTI audion siihen mittaan -> kun audio oli
+//   videoa pidempi (~1s), viimeinen puhe katosi. Korjaus: finalDur = max(video, audio).
+//   Jos audio pidempi: viimeinen videoframe jaadytetaan tpad=stop_mode=clone audion
+//   loppuun asti, ja fade out ajoitetaan finalDur-pohjalta. Audiota EI enaa trimata
+//   lyhyemmaksi; -shortest poistettu (se leikkaisi taas lyhyempaan). Jos video pidempi
+//   (normaali tapaus): kayttaytyy kuten v63 (apad padaa audion hiljaisuudella loppuun).
 // v57 (19.6): intro_image_url (pullokuva) -> 1.5s klippi sisällön ALKUUN, heti
 //   logo-intron jälkeen. Tällöin videon näkyvä kansi on pullo (IG/TikTok ottavat
 //   kannen framesta, YT myös ilman custom-thumbnailia). Failsafe: jos pullokuva
@@ -111,7 +118,7 @@ app.post('/merge', async (req, res) => {
   fs.mkdirSync(tmp, { recursive: true })
 
   try {
-    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips + logo${intro_image_url ? ' + bottle-intro' : ''} (v63)`)
+    console.log(`[merge] START ${job_id} — ${clip_urls.length} clips + logo${intro_image_url ? ' + bottle-intro' : ''} (v64)`)
 
     // 1. Lataa + normalisoi sisältöklipit erikseen (matala RAM)
     for (let i = 0; i < clip_urls.length; i++) {
@@ -150,40 +157,63 @@ app.post('/merge', async (req, res) => {
     // (uusi yhtenainen keyframe-virta koko sisallolle). Hieman hitaampi mutta poistaa
     // saumahypyt lopullisesti. Klipit ovat jo samaa kokoa/fps -> nopea.
     execSync(`ffmpeg -y -f concat -safe 0 -i ${tmp}/concat_content.txt -r 30 -g 30 -keyint_min 30 -sc_threshold 0 -c:v libx264 -preset veryfast -crf 26 -an ${tmp}/content_video.mp4`, { timeout: 120000, stdio: 'pipe' })
-    // v63: AUDIO KASITELLAAN ERIKSEEN tarkkaan oikean mittaiseksi ENNEN videoon yhdistamista.
-    // v62-bugi: -t + apad + atrim samassa komennossa konfliktoivat -> enkooderi toisti
-    // viimeisen audiopaketin -> "katujyra"-drone aanen lopussa (sanan jalkeen jumiin).
-    // Nyt: 1) tee audiosta tasan contentDur-mittainen oma tiedosto (apad padaa jos lyhyt,
-    // atrim leikkaa jos pitka, afade haivyttaa lopun). 2) yhdista video + valmis audio
-    // ilman -t-temppuja. Puhdas, ei konfliktia.
-    let contentDur = 0
+
+    // v64: LOPULLINEN KESTO = max(video, audio). Mittaa MOLEMMAT erikseen.
+    // v63-bugi: kesto laskettiin pelkasta videosta ja audio pakotettiin siihen ->
+    // audion (puheen) loppu leikkautui kun audio oli videoa pidempi.
+    let videoDur = 0
     try {
-      const probe = execSync(`ffprobe -v error -show_entries format=duration -of csv=p=0 ${tmp}/content_video.mp4`, { timeout: 15000 }).toString().trim()
-      contentDur = parseFloat(probe) || 0
+      const probeV = execSync(`ffprobe -v error -show_entries format=duration -of csv=p=0 ${tmp}/content_video.mp4`, { timeout: 15000 }).toString().trim()
+      videoDur = parseFloat(probeV) || 0
     } catch (e) { console.error(`[merge] ffprobe content_video failed: ${e.message}`) }
-    if (!(contentDur > 0)) {
+    if (!(videoDur > 0)) {
       const nClips = (clip_urls || []).length
       const sd = (Number(shot_duration) > 0 ? Number(shot_duration) : 5)
-      contentDur = nClips > 0 ? nClips * sd : 25
+      videoDur = nClips > 0 ? nClips * sd : 25
     }
-    const fadeStart = Math.max(0, contentDur - 0.4)
-    // 1) Audio tasan contentDur-mittaiseksi omaan tiedostoon. -t pakottaa keston,
-    // apad padaa hiljaisuudella jos audio lyhyempi, afade haivyttaa viimeiset 0.4s.
+    let audioDur = 0
+    try {
+      const probeA = execSync(`ffprobe -v error -show_entries format=duration -of csv=p=0 ${tmp}/audio.mp3`, { timeout: 15000 }).toString().trim()
+      audioDur = parseFloat(probeA) || 0
+    } catch (e) { console.error(`[merge] ffprobe audio failed: ${e.message}`) }
+
+    // finalDur = pidempi naista. Pieni 0.15s hapt audion loppuun ettei viimeinen tavu
+    // typisty enkoodauksen pyoristyksessa. Jos audion mittausta ei saatu, kaytetaan videoa.
+    const audioTarget = audioDur > 0 ? audioDur + 0.15 : 0
+    const finalDur = Math.max(videoDur, audioTarget)
+    const audioLonger = audioTarget > videoDur + 0.05
+    const fadeStart = Math.max(0, finalDur - 0.4)
+    console.log(`[merge] videoDur=${videoDur.toFixed(2)}s audioDur=${audioDur.toFixed(2)}s finalDur=${finalDur.toFixed(2)}s audioLonger=${audioLonger}`)
+
+    // 2a. VIDEO finalDur-mittaiseksi. Jos audio pidempi -> jaadyta viimeinen frame
+    // (tpad=stop_mode=clone) finalDur:iin. Jos video pidempi tai yhta pitka, tpad ei
+    // pidenna (video on jo >= finalDur, -t leikkaa tasan finalDur:iin). Fade out lopussa.
+    execSync(
+      `ffmpeg -y -i ${tmp}/content_video.mp4 ` +
+      `-vf "tpad=stop_mode=clone:stop_duration=${finalDur.toFixed(3)},fade=t=out:st=${fadeStart.toFixed(3)}:d=0.4" ` +
+      `-t ${finalDur.toFixed(3)} ` +
+      `-c:v libx264 -preset veryfast -crf 26 -r 30 -g 30 -keyint_min 30 -sc_threshold 0 -an ${tmp}/content_padded.mp4`,
+      { timeout: 120000, stdio: 'pipe' }
+    )
+
+    // 2b. AUDIO tasan finalDur-mittaiseksi omaan tiedostoon. apad padaa hiljaisuudella
+    // jos audio finalDuria lyhyempi (esim video pidempi); -t leikkaa jos pidempi.
+    // afade haivyttaa viimeiset 0.4s pehmeasti. Puhetta EI leikata: finalDur >= audio.
     execSync(
       `ffmpeg -y -i ${tmp}/audio.mp3 ` +
       `-af "apad,afade=t=out:st=${fadeStart.toFixed(3)}:d=0.4" ` +
-      `-t ${contentDur.toFixed(3)} -c:a aac -b:a 128k ${tmp}/audio_fitted.m4a`,
+      `-t ${finalDur.toFixed(3)} -c:a aac -b:a 128k ${tmp}/audio_fitted.m4a`,
       { timeout: 60000, stdio: 'pipe' }
     )
-    // 2) Video saa fade outin + valmis audio. -shortest turvaverkko (molemmat ~contentDur).
+
+    // 2c. Yhdista padattu video + valmis audio. EI -shortest (molemmat ovat tasan
+    // finalDur; -shortest voisi pyoristaa lyhyemmaksi ja leikata taas puhetta).
     execSync(
-      `ffmpeg -y -i ${tmp}/content_video.mp4 -i ${tmp}/audio_fitted.m4a ` +
-      `-vf "fade=t=out:st=${fadeStart.toFixed(3)}:d=0.4" ` +
-      `-c:v libx264 -preset veryfast -crf 26 -r 30 -g 30 -keyint_min 30 -sc_threshold 0 ` +
-      `-c:a copy -shortest ${tmp}/content.mp4`,
+      `ffmpeg -y -i ${tmp}/content_padded.mp4 -i ${tmp}/audio_fitted.m4a ` +
+      `-c:v copy -c:a copy ${tmp}/content.mp4`,
       { timeout: 90000, stdio: 'pipe' }
     )
-    console.log(`[merge] content ready`)
+    console.log(`[merge] content ready (finalDur ${finalDur.toFixed(2)}s)`)
 
     // 2.5 PULLO-INTROFRAME (v63) — pullokuvasta lyhyt klippi sisällön alkuun.
     // Kuva skaalataan 9:16-korttiin (sama 720x1280 kuin sisältö) mustalla paddingilla.
@@ -370,5 +400,5 @@ app.post('/search', async (req, res) => {
   }
 })
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v63' }))
-app.listen(process.env.PORT || 3000, () => console.log('Merge v63 running on port ' + (process.env.PORT || 3000)))
+app.get('/health', (_, res) => res.json({ ok: true, service: 'aura-merge', version: 'v64' }))
+app.listen(process.env.PORT || 3000, () => console.log('Merge v64 running on port ' + (process.env.PORT || 3000)))
